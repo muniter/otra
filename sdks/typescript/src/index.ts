@@ -1,5 +1,9 @@
 export { Otra } from "./app.ts";
-export type { OtraOptions, GetResultOptions, CreateQueueOptions } from "./app.ts";
+export type {
+  OtraOptions,
+  GetResultOptions,
+  CreateQueueOptions,
+} from "./app.ts";
 export { Ctx, parseDuration } from "./context.ts";
 export type { HandleResults } from "./context.ts";
 export {

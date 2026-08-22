@@ -1,5 +1,6 @@
 import {
   CancelledError,
+  DeterminismViolationError,
   type ChildSpawnOptions,
   type DurableHandle,
   type Effect,
@@ -123,12 +124,16 @@ export class Ctx {
     label: string,
     fn: () => T & RunReturnConstraint<T>,
   ): Op<RunResult<T>> {
-    return op({ type: "run", label, fn });
+    return op({ type: "run", label: userLabel(label), fn });
   }
 
   /** Durable timer.  The execution suspends; a worker resumes it when due. */
   sleep(duration: number | string, label = "$sleep"): Op<void> {
-    return op({ type: "sleep", label, seconds: parseDuration(duration) });
+    return op({
+      type: "sleep",
+      label: userLabel(label, "$sleep"),
+      seconds: parseDuration(duration),
+    });
   }
 
   /**
@@ -142,7 +147,10 @@ export class Ctx {
   ): Op<T> {
     return op({
       type: "event",
-      label: options.label ?? `$event:${eventName}`,
+      label:
+        options.label === undefined
+          ? `$event:${eventName}`
+          : userLabel(options.label),
       eventName,
       timeoutSeconds:
         options.timeout === undefined ? null : parseDuration(options.timeout),
@@ -164,7 +172,7 @@ export class Ctx {
     const { label, ...spawnOptions } = options;
     return op({
       type: "spawn",
-      label: label ?? `$spawn:${taskName}`,
+      label: label === undefined ? `$spawn:${taskName}` : userLabel(label),
       taskName,
       params,
       options: spawnOptions,
@@ -185,7 +193,7 @@ export class Ctx {
   ): Op<ExternalPromise<T>> {
     return op({
       type: "external",
-      label,
+      label: userLabel(label, "$promise"),
       timeoutSeconds:
         options.timeout === undefined ? null : parseDuration(options.timeout),
     });
@@ -219,16 +227,46 @@ export class Ctx {
 
   /** Deterministic current time (epoch ms), memoized on first execution. */
   now(label = "$now"): Op<number> {
-    return this.run(label, () => Date.now());
+    return op({
+      type: "run",
+      label: userLabel(label, "$now"),
+      fn: () => Date.now(),
+    });
   }
 
   /** Deterministic random number in [0, 1), memoized on first execution. */
   random(label = "$random"): Op<number> {
-    return this.run(label, () => Math.random());
+    return op({
+      type: "run",
+      label: userLabel(label, "$random"),
+      fn: () => Math.random(),
+    });
   }
 
   /** Deterministic UUID, memoized on first execution. */
   uuid(label = "$uuid"): Op<string> {
-    return this.run(label, () => crypto.randomUUID());
+    return op({
+      type: "run",
+      label: userLabel(label, "$uuid"),
+      fn: () => crypto.randomUUID(),
+    });
   }
+}
+
+/**
+ * Labels starting with '$' are engine-reserved: they name the journal slots
+ * the driver itself allocates ($sleep, $event:*, $spawn:*, $promise, $now,
+ * $random, $uuid) and, critically, '$cancel' -- the cancellation-delivery
+ * journal.  A user step squatting on '$cancel' would make the execution
+ * permanently un-cancellable, so the whole namespace is rejected except for
+ * the method's own engine default passed back verbatim.
+ */
+function userLabel(label: string, engineDefault?: string): string {
+  if (label === engineDefault) return label;
+  if (label.startsWith("$")) {
+    throw new DeterminismViolationError(
+      `label ${JSON.stringify(label)} uses the engine-reserved '$' prefix; pick another label`,
+    );
+  }
+  return label;
 }

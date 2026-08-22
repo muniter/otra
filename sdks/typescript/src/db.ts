@@ -39,15 +39,20 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Wrap a promise row id as the opaque token handed to the outside world. */
-export function promiseToken(execution: ExecutionRef, promiseId: string): string {
+export function promiseToken(
+  execution: ExecutionRef,
+  promiseId: string,
+): string {
   const address = `${execution.queueId}:${execution.rootId}:${promiseId}`;
   return `otr1_${Buffer.from(address).toString("base64url")}`;
 }
 
 /** Parse a token back to its queue-local promise address. */
-export function parsePromiseToken(
-  token: string,
-): { queueId: string; rootId: string; promiseId: string } {
+export function parsePromiseToken(token: string): {
+  queueId: string;
+  rootId: string;
+  promiseId: string;
+} {
   if (!token.startsWith("otr1_")) {
     throw new OtraError(`invalid promise token: ${JSON.stringify(token)}`);
   }
@@ -179,10 +184,15 @@ export class Db {
   }
 
   async ensurePartitions(name?: string): Promise<void> {
-    await this.client.query(`select otra.ensure_partitions($1)`, [name ?? null]);
+    await this.client.query(`select otra.ensure_partitions($1)`, [
+      name ?? null,
+    ]);
   }
 
-  async setQueuePolicy(name: string, options: QueuePolicyOptions): Promise<void> {
+  async setQueuePolicy(
+    name: string,
+    options: QueuePolicyOptions,
+  ): Promise<void> {
     const policy: Record<string, unknown> = {};
     if (options.defaultPartition !== undefined)
       policy.default_partition = options.defaultPartition;
@@ -190,10 +200,12 @@ export class Db {
       policy.partition_lookahead = options.partitionLookahead;
     if (options.partitionLookback !== undefined)
       policy.partition_lookback = options.partitionLookback;
-    if (options.cleanupTtl !== undefined) policy.cleanup_ttl = options.cleanupTtl;
+    if (options.cleanupTtl !== undefined)
+      policy.cleanup_ttl = options.cleanupTtl;
     if (options.cleanupLimit !== undefined)
       policy.cleanup_limit = options.cleanupLimit;
-    if (options.detachMode !== undefined) policy.detach_mode = options.detachMode;
+    if (options.detachMode !== undefined)
+      policy.detach_mode = options.detachMode;
     if (options.detachMinAge !== undefined)
       policy.detach_min_age = options.detachMinAge;
     await this.client.query(`select otra.set_queue_policy($1, $2::jsonb)`, [
@@ -372,7 +384,16 @@ export class Db {
   ): Promise<JsonValue> {
     const { rows } = await this.client.query(
       `select otra.record_run_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text, $7::jsonb, $8::double precision) as value`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, key, label, toJson(value), claimSeconds],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        key,
+        label,
+        toJson(value),
+        claimSeconds,
+      ],
     );
     return (rows[0].value ?? null) as JsonValue;
   }
@@ -386,7 +407,15 @@ export class Db {
   ): Promise<{ status: PromiseStatus }> {
     const { rows } = await this.client.query(
       `select status from otra.create_sleep_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text, $7::double precision)`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, key, label, seconds],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        key,
+        label,
+        seconds,
+      ],
     );
     return { status: rows[0].status };
   }
@@ -408,7 +437,16 @@ export class Db {
          $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text,
          $7::text, $8::double precision
        )`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, key, label, eventName, timeoutSeconds],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        key,
+        label,
+        eventName,
+        timeoutSeconds,
+      ],
     );
     return {
       status: rows[0].status,
@@ -424,7 +462,13 @@ export class Db {
   ): Promise<JsonValue> {
     const { rows } = await this.client.query(
       `select otra.record_cancel_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::jsonb) as position`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, toJson(position)],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        toJson(position),
+      ],
     );
     return (rows[0].position ?? null) as JsonValue;
   }
@@ -443,7 +487,15 @@ export class Db {
   }> {
     const { rows } = await this.client.query(
       `select id, status, value, error from otra.create_external_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text, $7::double precision)`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, key, label, timeoutSeconds],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        key,
+        label,
+        timeoutSeconds,
+      ],
     );
     return {
       id: rows[0].id,
@@ -475,10 +527,18 @@ export class Db {
     execution: ExecutionRef,
     workerId: string,
     blockerKeys: string[],
+    shielded = false,
   ): Promise<{ suspended: boolean; cancelRequested: boolean }> {
     const { rows } = await this.client.query(
-      `select suspended, cancel_requested from otra.suspend_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text[])`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, blockerKeys],
+      `select suspended, cancel_requested from otra.suspend_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text[], $6::boolean)`,
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        blockerKeys,
+        shielded,
+      ],
     );
     return {
       suspended: rows[0].suspended === true,
@@ -491,13 +551,16 @@ export class Db {
     workerId: string,
     result: unknown,
   ): Promise<void> {
-    await this.client.query(`select otra.complete_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::jsonb)`, [
-      execution.queueId,
-      execution.rootId,
-      execution.executionId,
-      workerId,
-      toJson(result),
-    ]);
+    await this.client.query(
+      `select otra.complete_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::jsonb)`,
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        toJson(result),
+      ],
+    );
   }
 
   async failAttempt(
@@ -512,7 +575,14 @@ export class Db {
   }> {
     const { rows } = await this.client.query(
       `select applied, failed_permanently, retry_at from otra.fail_attempt_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::jsonb, $6::boolean)`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, toJson(error), retryable],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        toJson(error),
+        retryable,
+      ],
     );
     return {
       applied: rows[0]?.applied ?? false,
@@ -528,7 +598,13 @@ export class Db {
   ): Promise<boolean> {
     const { rows } = await this.client.query(
       `select otra.defer_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::double precision) as deferred`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, delaySeconds],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        delaySeconds,
+      ],
     );
     return rows[0].deferred;
   }
@@ -540,7 +616,13 @@ export class Db {
   ): Promise<{ held: boolean; cancelRequested: boolean }> {
     const { rows } = await this.client.query(
       `select held, cancel_requested from otra.extend_claim_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::double precision)`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, claimSeconds],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        claimSeconds,
+      ],
     );
     return {
       held: rows[0]?.held === true,
@@ -555,7 +637,13 @@ export class Db {
   ): Promise<Array<{ executionId: string; action: string }>> {
     const { rows } = await this.client.query(
       `select execution_id, action from otra.request_cancel_local($1::uuid, $2::uuid, $3::uuid, $4::boolean, $5::text)`,
-      [execution.queueId, execution.rootId, execution.executionId, cascade, reason],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        cascade,
+        reason,
+      ],
     );
     return rows
       .filter((row: { action: string }) => row.action !== "noop")
@@ -572,7 +660,13 @@ export class Db {
   ): Promise<number> {
     const { rows } = await this.client.query(
       `select otra.kill_local($1::uuid, $2::uuid, $3::uuid, $4::boolean, $5::text) as killed`,
-      [execution.queueId, execution.rootId, execution.executionId, cascade, reason],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        cascade,
+        reason,
+      ],
     );
     return rows[0].killed;
   }
@@ -584,7 +678,13 @@ export class Db {
   ): Promise<boolean> {
     const { rows } = await this.client.query(
       `select otra.finalize_cancelled_local($1::uuid, $2::uuid, $3::uuid, $4::text, $5::jsonb) as finalized`,
-      [execution.queueId, execution.rootId, execution.executionId, workerId, error === null ? null : toJson(error)],
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        workerId,
+        error === null ? null : toJson(error),
+      ],
     );
     return rows[0].finalized === true;
   }
@@ -601,7 +701,9 @@ export class Db {
     ]);
   }
 
-  async getExecution(execution: ExecutionRef): Promise<ExecutionSnapshot | null> {
+  async getExecution(
+    execution: ExecutionRef,
+  ): Promise<ExecutionSnapshot | null> {
     const { rows } = await this.client.query(
       `select * from otra.get_execution_local($1, $2, $3)`,
       [execution.queueId, execution.rootId, execution.executionId],

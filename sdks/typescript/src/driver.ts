@@ -158,9 +158,29 @@ export async function driveOnce(
   const cancelRow = history.get("$cancel");
   const journaledDelivery = cancelRow !== undefined;
   let pendingReplayPosition: CancelPosition | null = null;
+  let setupError: DeterminismViolationError | null = null;
   if (cancelRow !== undefined) {
-    markCancelPending();
-    pendingReplayPosition = cancelRow.value as unknown as CancelPosition;
+    // Defense in depth: Ctx rejects user '$'-labels, but a legacy or
+    // hand-written row squatting on this key must fail loudly, not silently
+    // disable cancellation.
+    const position = cancelRow.value as unknown;
+    const keyed =
+      typeof position === "object" &&
+      position !== null &&
+      typeof (position as { key?: unknown }).key === "string";
+    const awaited =
+      typeof position === "object" &&
+      position !== null &&
+      Array.isArray((position as { await?: unknown }).await);
+    if (cancelRow.kind !== "cancel" || (!keyed && !awaited)) {
+      setupError = new DeterminismViolationError(
+        `the '$cancel' journal row is not a cancellation delivery record ` +
+          `(kind ${cancelRow.kind}); the reserved key was overwritten`,
+      );
+    } else {
+      markCancelPending();
+      pendingReplayPosition = position as CancelPosition;
+    }
   }
 
   const shouldDeliver = (): boolean =>
@@ -201,12 +221,32 @@ export async function driveOnce(
 
   // Heartbeat for the entire drive; its response doubles as the cancellation
   // discovery channel (Temporal delivers activity cancellation the same way).
+  // held = false is definitive -- the claim is gone (killed, stolen, or
+  // finalized elsewhere) -- so abort ctx.signal to unblock a well-behaved
+  // long step and abandon at the next loop iteration.  Without this a
+  // kill() lands only at the next guarded write, and a hung step never
+  // observes it at all.
+  let externalOutcome: DriveOutcome | null = null;
   const heartbeatMs = Math.max((claimSeconds * 1000) / 2, 500);
   const heartbeat = setInterval(() => {
     void db
       .extendClaim(claimed, workerId, claimSeconds)
-      .then(({ cancelRequested }) => {
+      .then(async ({ held, cancelRequested }) => {
         if (cancelRequested) markCancelPending();
+        if (held || externalOutcome !== null) return;
+        let killed = false;
+        try {
+          const snapshot = await db.getExecution(claimed);
+          killed = snapshot?.status === "cancelled";
+        } catch {
+          /* can't tell why; report the conservative 'lost' */
+        }
+        externalOutcome = { type: killed ? "killed" : "lost" };
+        abort.abort(
+          killed
+            ? new CancelledError("execution was killed")
+            : new Error(`worker ${workerId} lost its claim on ${executionId}`),
+        );
       })
       .catch(() => {});
   }, heartbeatMs);
@@ -216,11 +256,7 @@ export async function driveOnce(
     error: ErrorPayload | null,
   ): Promise<DriveOutcome> => {
     try {
-      const finalized = await db.finalizeCancelled(
-        claimed,
-        workerId,
-        error,
-      );
+      const finalized = await db.finalizeCancelled(claimed, workerId, error);
       return finalized ? { type: "cancelled" } : { type: "lost" };
     } catch {
       return { type: "lost" };
@@ -274,13 +310,17 @@ export async function driveOnce(
     blockerKeys: string[],
     position: CancelPosition,
   ): Promise<DriveOutcome | null> {
+    // Inside ctx.uninterruptible the park is allowed even with a pending
+    // undelivered cancel (suspend_local's p_shielded): delivery must wait
+    // for the shield to exit, never split a critical section in half.
     const { suspended, cancelRequested } = await db.suspend(
       claimed,
       workerId,
       blockerKeys,
+      shielded > 0,
     );
     if (suspended) return { type: "suspended" };
-    if (cancelRequested && !cancelDelivered) {
+    if (cancelRequested && !cancelDelivered && shielded === 0) {
       // Cancel landed between our last check and the park: deliver in place.
       markCancelPending();
       resume = await deliverFresh(position);
@@ -291,6 +331,13 @@ export async function driveOnce(
 
   async function driveLoop(): Promise<DriveOutcome> {
     while (true) {
+      // The heartbeat saw the claim disappear: stop resuming the generator.
+      // (Any guarded write would refuse us anyway; this skips the churn.)
+      if (externalOutcome !== null) return externalOutcome;
+      // A corrupt '$cancel' row was detected while loading history.
+      if (setupError !== null) {
+        return reportFailedAttempt(serializeError(setupError), false);
+      }
       const injected = resume.type === "throw" ? resume.error : null;
       let step: IteratorResult<Effect, unknown>;
       try {
@@ -316,8 +363,24 @@ export async function driveOnce(
       }
 
       if (step.done) {
-        if (cancelDelivered || journaledDelivery)
-          return finalizeCancelled(null);
+        if (cancelDelivered || journaledDelivery) {
+          // A journaled position the replay never reached means the code
+          // changed under an in-flight cancellation: still cancelled (the
+          // engine owns the outcome), but say what happened -- compensation
+          // did NOT run.
+          const unreached =
+            !cancelDelivered && pendingReplayPosition !== null
+              ? {
+                  name: "DeterminismViolationError",
+                  message:
+                    `journaled cancellation position ` +
+                    `${JSON.stringify(pendingReplayPosition)} was never ` +
+                    `reached during replay; compensation did not run ` +
+                    `(did the task code change?)`,
+                }
+              : null;
+          return finalizeCancelled(unreached);
+        }
         try {
           await db.complete(claimed, workerId, step.value);
         } catch (err) {

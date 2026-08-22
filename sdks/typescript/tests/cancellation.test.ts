@@ -543,3 +543,284 @@ test("a failed attempt with a pending cancel retries into compensation, then fin
   // And the first execution (cancelled with empty history) never ran at all.
   assert.equal((await app.getExecution(execution))!.status, "cancelled");
 });
+
+// --- delivery latency + claim-loss discovery regressions -------------------
+// (found reviewing the queue-local rework; the first two predate it)
+
+/** Resolve the physical table names for a queue (tests only). */
+async function tablesFor(pool: pg.Pool, queue: string) {
+  const { rows } = await pool.query(
+    "select replace(id::text, '-', '') as s from otra.queues where name = $1",
+    [queue],
+  );
+  const s = rows[0].s as string;
+  return { x: `x_${s}`, p: `p_${s}` };
+}
+
+test("cancelling an execution parked on retry backoff delivers without waiting it out", async () => {
+  const { app, pool } = env;
+  const calls = { compensate: 0 };
+
+  const task = app.task("slow-backoff", function* (_params: null, ctx) {
+    try {
+      yield* ctx.run("prep", () => "ready");
+      yield* ctx.run("explode", () => {
+        throw new Error("attempt failed");
+      });
+      return "unreachable";
+    } catch (err) {
+      if (isCancellation(err)) {
+        yield* ctx.run("compensate", () => {
+          calls.compensate += 1;
+        });
+      }
+      throw err;
+    }
+  });
+
+  const execution = await app.spawn(task, null, {
+    maxAttempts: 5,
+    retryStrategy: { kind: "fixed", base_s: 3600 },
+  });
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick(); // attempt 1 fails; retry scheduled an hour out
+
+  const { x } = await tablesFor(pool, "default");
+  const before = await pool.query(
+    `select status, run_after > otra.now() as parked from otra.${x} where root_id = $1 and id = $2`,
+    [execution.rootId, execution.executionId],
+  );
+  assert.equal(before.rows[0].status, "pending");
+  assert.equal(before.rows[0].parked, true);
+
+  await app.cancel(execution, { reason: "no point retrying" });
+
+  // The whole point: NO clock advance. The cancel must expedite the row.
+  await worker.tick();
+  const snapshot = (await app.getExecution(execution))!;
+  assert.equal(snapshot.status, "cancelled");
+  assert.equal(calls.compensate, 1);
+});
+
+test("a step failing with an undelivered cancel pending retries immediately, not after backoff", async () => {
+  const { app } = env;
+  const gate = new EventEmitter();
+  const calls = { compensate: 0 };
+  let releaseStep: (() => void) | null = null;
+
+  const task = app.task("fails-under-cancel", function* (_params: null, ctx) {
+    try {
+      yield* ctx.run("prep", () => "ready");
+      yield* ctx.run("blocking-step", async () => {
+        gate.emit("entered");
+        await new Promise<void>((resolve) => {
+          releaseStep = resolve;
+        });
+        throw new Error("step failed while cancel was pending");
+      });
+      return "unreachable";
+    } catch (err) {
+      if (isCancellation(err)) {
+        yield* ctx.run("compensate", () => {
+          calls.compensate += 1;
+        });
+      }
+      throw err;
+    }
+  });
+
+  const execution = await app.spawn(task, null, {
+    maxAttempts: 5,
+    retryStrategy: { kind: "fixed", base_s: 3600 },
+  });
+  const worker = app.createWorker({ workerId: "w1" });
+
+  const entered = once(gate, "entered");
+  const inflight = worker.tick();
+  await entered;
+  await app.cancel(execution); // running: flag only ('requested')
+  releaseStep!();
+  await inflight; // the step's failure lands as a failed attempt
+
+  // The retry must be immediate (cancel undelivered), not an hour out.
+  await worker.tick();
+  const snapshot = (await app.getExecution(execution))!;
+  assert.equal(snapshot.status, "cancelled");
+  assert.equal(calls.compensate, 1);
+});
+
+test("kill() aborts ctx.signal mid-step; the hung step unblocks and the drive abandons", async () => {
+  const { app, pool } = env;
+  const gate = new EventEmitter();
+  let sawAbort = false;
+
+  const task = app.task("hangs-forever", function* (_params: null, ctx) {
+    yield* ctx.run("hang", () => {
+      gate.emit("entered");
+      return new Promise<string>((resolve) => {
+        // A well-behaved long step: it only ends when the signal fires.
+        ctx.signal.addEventListener(
+          "abort",
+          () => {
+            sawAbort = true;
+            resolve("aborted");
+          },
+          { once: true },
+        );
+      });
+    });
+    return "unreachable";
+  });
+
+  const execution = await app.spawn(task, null);
+  // claimSeconds=1 floors the heartbeat at its 500ms minimum.
+  const worker = app.createWorker({ workerId: "w1", claimSeconds: 1 });
+
+  const entered = once(gate, "entered");
+  const inflight = worker.tick();
+  await entered;
+  await app.kill(execution, { reason: "operator kill" });
+
+  // Without heartbeat discovery this hangs forever; the abort must arrive
+  // on the next heartbeat (~500ms).
+  await inflight;
+
+  assert.equal(sawAbort, true);
+  const snapshot = (await app.getExecution(execution))!;
+  assert.equal(snapshot.status, "cancelled");
+  // The zombie write was refused: nothing landed in the journal.
+  const { p } = await tablesFor(pool, "default");
+  const { rows } = await pool.query(
+    `select 1 from otra.${p} where root_id = $1 and execution_id = $2 and key = 'hang'`,
+    [execution.rootId, execution.executionId],
+  );
+  assert.equal(rows.length, 0);
+});
+
+test("a stolen claim aborts ctx.signal mid-step and the drive abandons quietly", async () => {
+  const { app, pool } = env;
+  const gate = new EventEmitter();
+  let sawAbort = false;
+
+  const task = app.task("steal-me", function* (_params: null, ctx) {
+    yield* ctx.run("hang", () => {
+      gate.emit("entered");
+      return new Promise<string>((resolve) => {
+        ctx.signal.addEventListener(
+          "abort",
+          () => {
+            sawAbort = true;
+            resolve("aborted");
+          },
+          { once: true },
+        );
+      });
+    });
+    return "unreachable";
+  });
+
+  const execution = await app.spawn(task, null);
+  const worker = app.createWorker({ workerId: "w1", claimSeconds: 1 });
+
+  const entered = once(gate, "entered");
+  const inflight = worker.tick();
+  await entered;
+  // Simulate another worker taking over after a lease expiry.
+  const { x, p } = await tablesFor(pool, "default");
+  await pool.query(
+    `update otra.${x} set claimed_by = 'thief', claim_expires_at = otra.now() + interval '1h' where root_id = $1 and id = $2`,
+    [execution.rootId, execution.executionId],
+  );
+
+  await inflight;
+
+  assert.equal(sawAbort, true);
+  // The thief still owns it; w1 wrote nothing.
+  const { rows } = await pool.query(
+    `select status, claimed_by from otra.${x} where root_id = $1 and id = $2`,
+    [execution.rootId, execution.executionId],
+  );
+  assert.equal(rows[0].status, "running");
+  assert.equal(rows[0].claimed_by, "thief");
+  const journal = await pool.query(
+    `select 1 from otra.${p} where root_id = $1 and execution_id = $2 and key = 'hang'`,
+    [execution.rootId, execution.executionId],
+  );
+  assert.equal(journal.rows.length, 0);
+});
+
+test("uninterruptible survives suspension: delivery waits for the shield to exit", async () => {
+  const { app } = env;
+  const calls = { a: 0, b: 0, outside: 0, compensate: 0 };
+
+  const task = app.task("shielded-sleep", function* (_params: null, ctx) {
+    try {
+      yield* ctx.run("prep", () => "ready");
+      yield* ctx.uninterruptible(function* () {
+        yield* ctx.run("critical-a", () => {
+          calls.a += 1;
+        });
+        // The critical section SUSPENDS. A cancel arriving while parked
+        // must not split the section in half.
+        yield* ctx.sleep("1s");
+        yield* ctx.run("critical-b", () => {
+          calls.b += 1;
+        });
+      });
+      yield* ctx.run("outside", () => {
+        calls.outside += 1;
+      });
+      return "done";
+    } catch (err) {
+      if (isCancellation(err)) {
+        yield* ctx.run("compensate", () => {
+          calls.compensate += 1;
+        });
+      }
+      throw err;
+    }
+  });
+
+  const execution = await app.spawn(task, null);
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick(); // parks on the in-shield sleep
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
+
+  await app.cancel(execution, { reason: "mid-shield cancel" });
+  await worker.tick(); // woken; must re-park (or finish the shield), never split it
+  await env.advance(2); // the in-shield sleep comes due
+  await worker.drain();
+
+  const snapshot = (await app.getExecution(execution))!;
+  assert.equal(snapshot.status, "cancelled");
+  // The whole critical section committed; delivery landed after the shield.
+  assert.deepEqual(calls, { a: 1, b: 1, outside: 0, compensate: 1 });
+});
+
+test("user labels may not use the engine-reserved '$' prefix", async () => {
+  const { app } = env;
+  // A user step keyed '$cancel' would occupy the cancellation journal slot,
+  // making the execution permanently un-cancellable and discarding its
+  // result on return. Reject the whole '$' namespace up front.
+  const task = app.task("label-squatter", function* (_params: null, ctx) {
+    return yield* ctx.run("$cancel", () => "hijack");
+  });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick();
+
+  const snapshot = (await app.getExecution(execution))!;
+  assert.equal(snapshot.status, "failed"); // permanent: retries can't help
+  assert.equal(snapshot.error?.name, "DeterminismViolationError");
+  assert.match(snapshot.error?.message ?? "", /reserved/);
+  assert.equal(snapshot.attempt, 1);
+
+  // The engine's own defaults still work, including explicit pass-through.
+  const ok = app.task("default-labels", function* (_params: null, ctx) {
+    yield* ctx.sleep(0, "$sleep");
+    return yield* ctx.now();
+  });
+  const okRef = await app.spawn(ok, null);
+  await worker.drain();
+  assert.equal((await app.getExecution(okRef))!.status, "completed");
+});

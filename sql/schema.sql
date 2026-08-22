@@ -1532,9 +1532,11 @@ begin
 end;
 $$ language plpgsql;
 
+drop function if exists otra.suspend_local (uuid, uuid, uuid, text, text[]);
 create or replace function otra.suspend_local (
   p_queue uuid, p_root uuid, p_execution uuid, p_worker text,
-  p_blocker_keys text[]
+  p_blocker_keys text[],
+  p_shielded boolean default false
 ) returns table (suspended boolean, cancel_requested boolean) as $$
 declare
   v_storage text := replace(p_queue::text, '-', '');
@@ -1561,7 +1563,11 @@ begin
       where root_id = $1 and execution_id = $2 and key = ''$cancel'')',
     v_p
   ) into v_exists using p_root, p_execution;
-  if v_cancel is not null and not v_exists then
+  -- A pending cancel blocks parking only BEFORE delivery -- the driver must
+  -- deliver instead -- UNLESS the generator is inside ctx.uninterruptible:
+  -- a shielded critical section may suspend, and delivery waits until the
+  -- shield exits (otherwise the section would commit in half).
+  if v_cancel is not null and not v_exists and not p_shielded then
     return query select false, true; return;
   end if;
   execute format(
@@ -1659,8 +1665,11 @@ create or replace function otra._fail_attempt_local (
   p_error jsonb, p_retryable boolean
 ) returns table (failed_permanently boolean, retry_at timestamptz) as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_storage text := replace(p_queue::text, '-', '');
+  v_x text := 'x_' || v_storage;
+  v_p text := 'p_' || v_storage;
   v_row record;
+  v_delivered boolean;
   v_retry_at timestamptz;
 begin
   execute format(
@@ -1672,10 +1681,24 @@ begin
     return query select false, null::timestamptz; return;
   end if;
   if p_retryable and v_row.attempt + 1 < v_row.max_attempts then
-    begin
-      v_retry_at := otra.now() + otra._backoff(v_row.retry_strategy, v_row.attempt + 1);
-    exception when others then v_retry_at := null;
-    end;
+    execute format(
+      'select exists (select 1 from otra.%I
+        where root_id = $1 and execution_id = $2 and key = ''$cancel'')',
+      v_p
+    ) into v_delivered using p_root, p_execution;
+    if v_row.cancel_requested_at is not null and not v_delivered then
+      -- A cancel is pending but CancelledError has not been delivered yet:
+      -- the retry exists only so a worker can deliver it, so it must run
+      -- now, not after the backoff.  (Once '$cancel' is journaled, failures
+      -- are compensation retries and keep their backoff -- a failing
+      -- compensation step must not hot-loop.)
+      v_retry_at := otra.now();
+    else
+      begin
+        v_retry_at := otra.now() + otra._backoff(v_row.retry_strategy, v_row.attempt + 1);
+      exception when others then v_retry_at := null;
+      end;
+    end if;
   end if;
   if v_retry_at is not null then
     execute format(
@@ -1852,6 +1875,15 @@ begin
         v_x
       ) using v_now, p_root, v_row.id;
       execution_id := v_row.id; action := 'woken'; return next;
+    elsif v_row.status = 'pending' then
+      -- Waiting out a retry backoff: expedite it, or the cancel would sit
+      -- undelivered until the retry was due (up to the backoff cap).
+      execute format(
+        'update otra.%I set run_after = least(run_after, $1), updated_at = $1
+          where root_id = $2 and id = $3',
+        v_x
+      ) using v_now, p_root, v_row.id;
+      execution_id := v_row.id; action := 'requested'; return next;
     else
       execution_id := v_row.id; action := 'requested'; return next;
     end if;

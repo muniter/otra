@@ -193,7 +193,9 @@ export class Otra {
     await this.db.emitEvent(queue ?? this.queue, name, payload ?? null);
   }
 
-  async getExecution(execution: ExecutionRef): Promise<ExecutionSnapshot | null> {
+  async getExecution(
+    execution: ExecutionRef,
+  ): Promise<ExecutionSnapshot | null> {
     return this.db.getExecution(execution);
   }
 
