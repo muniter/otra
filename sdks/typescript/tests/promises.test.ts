@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { TimeoutError, isCancellation } from "../src/index.ts";
@@ -222,11 +223,127 @@ test("only external promises can be settled from outside", async () => {
   const token = `otr1_${Buffer.from(
     `${execution.queueId}:${execution.rootId}:${rows[0].id}`,
   ).toString("base64url")}`;
-  assert.equal(await app.resolvePromise(token, "hijack"), false);
+
+  // Loud, not a quiet false: "false" means "already settled, you lost the
+  // race", and a run checkpoint is not a race anyone can win.
+  await assert.rejects(
+    app.resolvePromise(token, "hijack"),
+    /does not name an external promise/,
+  );
+  await assert.rejects(
+    app.rejectPromise(token, "hijack"),
+    /does not name an external promise/,
+  );
+
+  // The single-author journal is intact: the run row still holds its value.
+  const after = await pool.query(
+    `select kind, status, value from otra.p_${execution.queueId.replaceAll("-", "")}
+      where root_id = $1 and id = $2`,
+    [execution.rootId, rows[0].id],
+  );
+  assert.deepEqual(after.rows[0], {
+    kind: "run",
+    status: "resolved",
+    value: 42,
+  });
 
   // And a malformed token is rejected loudly, not treated as a miss.
   await assert.rejects(
     app.resolvePromise("not-a-token", 1),
     /invalid promise token/,
   );
+});
+
+test("a well-formed token naming nothing throws instead of reporting a miss", async () => {
+  const { app } = env;
+  const task = app.task("bystander", function* (_params: null, ctx) {
+    yield* ctx.sleep("1h");
+    return "done";
+  });
+  const execution = await app.spawn(task, null);
+  await app.createWorker({ workerId: "w1" }).tick();
+
+  const nowhere = `otr1_${Buffer.from(
+    `${execution.queueId}:${randomUUID()}:${randomUUID()}`,
+  ).toString("base64url")}`;
+  await assert.rejects(
+    app.resolvePromise(nowhere, "hello"),
+    /does not name an external promise/,
+  );
+  await assert.rejects(
+    app.rejectPromise(nowhere, "nope"),
+    /does not name an external promise/,
+  );
+
+  // A token whose queue does not exist either is loud too, never a quiet miss.
+  const elsewhere = `otr1_${Buffer.from(
+    `${randomUUID()}:${randomUUID()}:${randomUUID()}`,
+  ).toString("base64url")}`;
+  await assert.rejects(
+    app.resolvePromise(elsewhere, "hello"),
+    /does not exist/,
+  );
+});
+
+test("spawning a child onto a key held by another promise kind fails loudly", async () => {
+  const { app, pool } = env;
+  app.task("host", function* (_params: null, ctx) {
+    yield* ctx.sleep("1h");
+    return "done";
+  });
+  await app.spawn("host", null);
+
+  // Claim through SQL so the execution is 'running' under a known worker id.
+  const claimed = await pool.query(
+    `select queue_id, root_id, execution_id
+       from otra.claim_local('default', 'w-direct', 30, 1)`,
+  );
+  const { queue_id, root_id, execution_id } = claimed.rows[0];
+
+  // A run checkpoint already occupies the key the child spawn will want.
+  await pool.query(
+    `insert into otra.p_${queue_id.replaceAll("-", "")}
+       (root_id, execution_id, key, label, kind, status, value, settled_at)
+     values ($1, $2, 'audit', 'audit', 'run', 'resolved', '1'::jsonb, otra.now())`,
+    [root_id, execution_id],
+  );
+
+  // The old code fell through to the insert and surfaced a bare 23505.
+  await assert.rejects(
+    pool.query(
+      `select * from otra.spawn_child_local(
+         $1, $2, $3, 'w-direct', 'audit', 'audit', 'child-fn', 'null'::jsonb
+       )`,
+      [queue_id, root_id, execution_id],
+    ),
+    (err: unknown) => {
+      const failure = err as { code?: string; message?: string };
+      assert.equal(failure.code, "OT003");
+      assert.match(failure.message ?? "", /"audit"/);
+      assert.match(failure.message ?? "", /run/);
+      return true;
+    },
+  );
+});
+
+test("settling an already-settled external promise returns false", async () => {
+  const { app } = env;
+  let token: string | undefined;
+
+  const task = app.task("second-place", function* (_params: null, ctx) {
+    const p = yield* ctx.promise<string>("slot");
+    yield* ctx.run("leak", () => {
+      token = p.token;
+    });
+    return yield* ctx.await(p);
+  });
+
+  await app.spawn(task, null);
+  await app.createWorker({ workerId: "w1" }).tick();
+
+  assert.equal(await app.resolvePromise(token!, "winner"), true);
+  // Losing a settled race is an ordinary outcome, reported as false -- it is
+  // NOT the same condition as "that token names no external promise".
+  assert.equal(await app.resolvePromise(token!, "loser"), false);
+  assert.equal(await app.rejectPromise(token!, "loser"), false);
 });

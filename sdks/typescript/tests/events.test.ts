@@ -125,6 +125,26 @@ test("an event name is an immutable fact: repeat waits agree, repeat emits are n
   assert.equal(rows[0].v, "1");
 });
 
+test("emitEvent reports whether this call created the fact", async () => {
+  const { app } = env;
+
+  // The return value is the only way a caller can tell "I wrote this fact"
+  // from "someone beat me to it" -- a repeat emit with a DIFFERENT payload
+  // changes nothing at all, silently.
+  assert.equal(await app.emitEvent("shipment:1", { carrier: "first" }), true);
+  assert.equal(await app.emitEvent("shipment:1", { carrier: "second" }), false);
+
+  const task = app.task("carrier-reader", function* (_params: null, ctx) {
+    const fact = yield* ctx.waitForEvent<{ carrier: string }>("shipment:1");
+    return fact.carrier;
+  });
+  const execution = await app.spawn(task, null);
+  await app.createWorker({ workerId: "w1" }).tick();
+
+  // The waiter sees the original payload, not the discarded second one.
+  assert.equal(await app.getResult(execution), "first");
+});
+
 test("a no-op re-emit does not disturb waiters already resolved by the fact", async () => {
   const { app } = env;
   const task = app.task("late-arrival", function* (_params: null, ctx) {

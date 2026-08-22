@@ -43,6 +43,18 @@ export interface CreateQueueOptions {
   storageMode?: QueueStorageMode;
 }
 
+export interface DropQueueOptions {
+  /** Drop even while non-terminal executions remain. */
+  force?: boolean;
+}
+
+export interface CleanupOptions {
+  /** Postgres interval string, e.g. "30 days"; defaults to queue policy. */
+  ttl?: string;
+  /** Maximum rows swept per batch; defaults to queue policy. */
+  limit?: number;
+}
+
 function isPool(db: unknown): db is pg.Pool {
   return typeof (db as { query?: unknown })?.query === "function";
 }
@@ -106,6 +118,18 @@ export class Otra {
     await this.db.createQueue(name, options.storageMode);
   }
 
+  /**
+   * Drop a queue and all of its storage, defaulting to this app's queue.
+   * Refuses while any execution is still non-terminal -- their workers would
+   * hit a vanished table mid-replay -- unless `force` is set.
+   */
+  async dropQueue(
+    name = this.queue,
+    options: DropQueueOptions = {},
+  ): Promise<void> {
+    await this.db.dropQueue(name, options.force ?? false);
+  }
+
   /** Return a provisioned queue, or null when it does not exist. */
   async getQueue(name = this.queue): Promise<Queue | null> {
     return this.db.getQueue(name);
@@ -147,6 +171,20 @@ export class Otra {
     return this.db.getQueuePolicy(name);
   }
 
+  /**
+   * Retention sweep for one queue (this app's by default): deletes finished
+   * execution trees whose root settled longer ago than `ttl`, and event facts
+   * older than it. `ttl` is a Postgres interval string ("30 days"), `limit`
+   * bounds the batch; omitting either uses the queue's own policy. Run it on
+   * a schedule -- nothing calls it for you.
+   */
+  async cleanup(
+    name = this.queue,
+    options: CleanupOptions = {},
+  ): Promise<void> {
+    await this.db.cleanup(name, options.ttl ?? null, options.limit ?? null);
+  }
+
   /** List old empty partitions eligible for an operator-managed detach. */
   async listDetachCandidates(name?: string): Promise<DetachCandidate[]> {
     return this.db.listDetachCandidates(name);
@@ -182,13 +220,19 @@ export class Otra {
   /**
    * Resolve one external promise by its token (from `ctx.promise`), waking
    * the execution awaiting it. Write-once: returns false if it was already
-   * settled (or the token names anything other than an external promise).
+   * settled. Throws `OtraError` if the token names anything other than an
+   * external promise -- an internal journal row, or nothing at all -- since
+   * that is a programming error rather than a lost race.
    */
   async resolvePromise(token: string, value: unknown): Promise<boolean> {
     return this.db.resolvePromise(token, value);
   }
 
-  /** Reject one external promise by its token; the await throws, catchably. */
+  /**
+   * Reject one external promise by its token; the await throws, catchably.
+   * Same outcomes as {@link resolvePromise}: false when already settled,
+   * `OtraError` when the token names no external promise.
+   */
   async rejectPromise(
     token: string,
     error: string | { message: string; name?: string },
@@ -197,13 +241,19 @@ export class Otra {
     return this.db.rejectPromise(token, payload);
   }
 
-  /** Emit an event, resolving every pending wait for it on the queue. */
+  /**
+   * Emit an event, resolving every pending wait for it on the queue.  An
+   * event name is an immutable one-shot fact: returns true when this call
+   * created it, false when the name was already a fact -- in which case a
+   * repeat emit with a DIFFERENT payload changed nothing, waiters keep seeing
+   * the first payload.
+   */
   async emitEvent(
     name: string,
     payload?: unknown,
     queue?: string,
-  ): Promise<void> {
-    await this.db.emitEvent(queue ?? this.queue, name, payload ?? null);
+  ): Promise<boolean> {
+    return this.db.emitEvent(queue ?? this.queue, name, payload ?? null);
   }
 
   async getExecution(

@@ -164,6 +164,10 @@ export class Db {
     ]);
   }
 
+  async dropQueue(name: string, force = false): Promise<void> {
+    await this.client.query(`select otra.drop_queue($1, $2)`, [name, force]);
+  }
+
   async getQueue(name: string): Promise<Queue | null> {
     const { rows } = await this.client.query(
       `select name, storage_mode from otra.get_queue($1)`,
@@ -236,6 +240,21 @@ export class Db {
       detachMode: row.detach_mode,
       detachMinAge: row.detach_min_age,
     };
+  }
+
+  /**
+   * Delete finished execution trees and expired event facts for one queue.
+   * A null ttl/limit falls back to the queue's own retention policy.
+   */
+  async cleanup(
+    name: string,
+    ttl: string | null = null,
+    limit: number | null = null,
+  ): Promise<void> {
+    await this.client.query(
+      `select otra.cleanup_local($1, $2::interval, $3::int)`,
+      [name, ttl, limit],
+    );
   }
 
   async listDetachCandidates(name?: string): Promise<DetachCandidate[]> {
@@ -362,7 +381,7 @@ export class Db {
     keys: string[],
   ): Promise<Map<string, PromiseRow>> {
     const { rows } = await this.client.query(
-      `select id, key, null as label, kind, status, value, error, child_execution_id
+      `select id, key, label, kind, status, value, error, child_execution_id
          from otra.get_promises_local($1::uuid, $2::uuid, $3::uuid, $4::text[])`,
       [execution.queueId, execution.rootId, execution.executionId, keys],
     );
@@ -505,22 +524,39 @@ export class Db {
     };
   }
 
+  /**
+   * Settle an external promise by token.  True when this call settled it,
+   * false when it had already been settled (an ordinary lost race against a
+   * write-once register).  A token that names no external promise -- an
+   * internal journal row, or nothing at all -- throws: it is a programming
+   * error, not a race.
+   */
   async resolvePromise(token: string, value: unknown): Promise<boolean> {
     const address = parsePromiseToken(token);
     const { rows } = await this.client.query(
-      `select otra.resolve_promise_local($1::uuid, $2::uuid, $3::uuid, $4::jsonb) as settled`,
+      `select otra.resolve_promise_local($1::uuid, $2::uuid, $3::uuid, $4::jsonb) as outcome`,
       [address.queueId, address.rootId, address.promiseId, toJson(value)],
     );
-    return rows[0].settled === true;
+    return Db.settlementOutcome(rows[0].outcome, token);
   }
 
+  /** Reject an external promise by token; see {@link resolvePromise}. */
   async rejectPromise(token: string, error: ErrorPayload): Promise<boolean> {
     const address = parsePromiseToken(token);
     const { rows } = await this.client.query(
-      `select otra.reject_promise_local($1::uuid, $2::uuid, $3::uuid, $4::jsonb) as settled`,
+      `select otra.reject_promise_local($1::uuid, $2::uuid, $3::uuid, $4::jsonb) as outcome`,
       [address.queueId, address.rootId, address.promiseId, toJson(error)],
     );
-    return rows[0].settled === true;
+    return Db.settlementOutcome(rows[0].outcome, token);
+  }
+
+  private static settlementOutcome(outcome: string, token: string): boolean {
+    if (outcome === "not_external") {
+      throw new OtraError(
+        `token ${JSON.stringify(token)} does not name an external promise`,
+      );
+    }
+    return outcome !== "already_settled";
   }
 
   async suspend(
@@ -689,16 +725,21 @@ export class Db {
     return rows[0].finalized === true;
   }
 
+  /**
+   * Emit the one-shot fact (queue, name).  True when this call created it;
+   * false when the name was already a fact -- a repeat emit with a DIFFERENT
+   * payload changed nothing, the first write stays canonical.
+   */
   async emitEvent(
     queue: string,
     name: string,
     payload: unknown,
-  ): Promise<void> {
-    await this.client.query(`select otra.emit_event_local($1, $2, $3::jsonb)`, [
-      queue,
-      name,
-      toJson(payload),
-    ]);
+  ): Promise<boolean> {
+    const { rows } = await this.client.query(
+      `select otra.emit_event_local($1, $2, $3::jsonb) as created`,
+      [queue, name, toJson(payload)],
+    );
+    return rows[0].created === true;
   }
 
   /** Database clock (otra.now()), epoch milliseconds -- honors the fake clock. */

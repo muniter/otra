@@ -95,6 +95,93 @@ test("queue names cannot collide with another queue's physical relations", async
   ]);
 });
 
+test("drops a queue's storage and frees the name for a fresh queue", async () => {
+  const { app, pool } = env;
+  await app.createQueue("orders");
+
+  const before = await pool.query(
+    `select id, replace(id::text, '-', '') as storage
+       from otra.queues where name = 'orders'`,
+  );
+  const previousId = before.rows[0].id;
+  const previousStorage = before.rows[0].storage;
+
+  await app.dropQueue("orders");
+
+  assert.equal(await app.getQueue("orders"), null);
+  const relics = await pool.query(
+    `select count(*)::int as count
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+      where c.relname like $1`,
+    [`%${previousStorage}%`],
+  );
+  assert.equal(relics.rows[0].count, 0);
+
+  // The name is free again, and the new queue gets its own storage identity.
+  await app.createQueue("orders");
+  const after = await pool.query(
+    `select id from otra.queues where name = 'orders'`,
+  );
+  assert.notEqual(after.rows[0].id, previousId);
+
+  const task = app.task("after-drop", function* () {
+    return "ok";
+  });
+  const execution = await app.spawn(task, null);
+  await app.createWorker({ workerId: "w1" }).drain();
+  assert.equal(await app.getResult(execution), "ok");
+});
+
+test("dropping a partitioned queue removes its partitions and side tables", async () => {
+  const { app, pool } = env;
+  await app.createQueue("archive", { storageMode: "partitioned" });
+  const { rows } = await pool.query(
+    `select replace(id::text, '-', '') as storage
+       from otra.queues where name = 'archive'`,
+  );
+  const storage = rows[0].storage;
+
+  await app.dropQueue("archive");
+
+  const relics = await pool.query(
+    `select count(*)::int as count
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+      where c.relname like $1`,
+    [`%${storage}%`],
+  );
+  assert.equal(relics.rows[0].count, 0);
+  assert.deepEqual(await app.listQueues(), []);
+});
+
+test("refuses to drop a queue with a live execution unless forced", async () => {
+  const { app } = env;
+  await app.createQueue("orders");
+  app.task("parks", function* (_params: null, ctx) {
+    yield* ctx.sleep("1h");
+    return "done";
+  });
+
+  const execution = await app.spawn("parks", null);
+  await assert.rejects(app.dropQueue("orders"), /non-terminal execution/);
+
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick();
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
+  await assert.rejects(app.dropQueue("orders"), /non-terminal execution/);
+
+  await app.dropQueue("orders", { force: true });
+  assert.equal(await app.getQueue("orders"), null);
+});
+
+test("dropping an unknown queue is an error", async () => {
+  await assert.rejects(
+    env.app.dropQueue("no-such-queue"),
+    /Queue "no-such-queue" does not exist/,
+  );
+});
+
 test("provisions a partitioned queue with its current storage window", async () => {
   const { app, pool } = env;
 
@@ -414,6 +501,48 @@ test("discovers old empty partitions eligible for detach", async () => {
   );
 });
 
+test("an orphaned promise partition stays visible after its execution sibling is detached", async () => {
+  const { app, pool } = env;
+  await app.createQueue("archive", { storageMode: "partitioned" });
+  await app.setQueuePolicy("archive", {
+    detachMode: "empty",
+    detachMinAge: "30 days",
+  });
+  await env.advance(120 * 24 * 60 * 60);
+
+  const before = await app.listDetachCandidates("archive");
+  assert.equal(before.length, 10);
+
+  const { rows } = await pool.query(
+    `select 'x_' || replace(id::text, '-', '') as x,
+            'p_' || replace(id::text, '-', '') as p
+       from otra.queues where name = 'archive'`,
+  );
+  const { x, p } = rows[0] as { x: string; p: string };
+  const tag = before
+    .map((candidate) => candidate.partitionTable)
+    .find((name) => name.startsWith(`${x}_`))!
+    .slice(x.length + 1);
+
+  // An operator (or a crash between the pair's two DETACH statements) leaves
+  // the promise partition behind. Its x sibling can no longer vouch for it.
+  await pool.query(
+    `alter table otra."${x}" detach partition otra."${x}_${tag}"`,
+  );
+
+  const after = await app.listDetachCandidates("archive");
+  assert.equal(
+    after.some((candidate) => candidate.partitionTable === `${x}_${tag}`),
+    false,
+  );
+  // The orphan must stay listed -- otherwise it is invisible forever.
+  assert.deepEqual(
+    after.filter((candidate) => candidate.partitionTable === `${p}_${tag}`),
+    [{ queueName: "archive", parentTable: p, partitionTable: `${p}_${tag}` }],
+  );
+  assert.equal(after.length, 9);
+});
+
 test("keeps a promise generation attached while its execution generation is live", async () => {
   const { app, pool } = env;
   await app.createQueue("archive", { storageMode: "partitioned" });
@@ -442,6 +571,54 @@ test("keeps a promise generation attached while its execution generation is live
     candidates.some((candidate) => candidate.partitionTable.endsWith(liveTag)),
     false,
   );
+});
+
+test("cleanup expires finished trees and event facts past the TTL", async () => {
+  const { app, pool } = env;
+  await app.createQueue("orders");
+  const task = app.task("receipt", function* (params: { id: number }) {
+    return params.id;
+  });
+  const worker = app.createWorker({ workerId: "w1" });
+
+  const oldA = await app.spawn(task, { id: 1 });
+  const oldB = await app.spawn(task, { id: 2 });
+  await worker.drain();
+  await app.emitEvent("stale-fact", { v: 1 });
+
+  await env.advance(2 * 24 * 60 * 60);
+
+  const young = await app.spawn(task, { id: 3 });
+  await worker.drain();
+  await app.emitEvent("fresh-fact", { v: 2 });
+
+  const survivors = async (): Promise<number> => {
+    const found = await Promise.all(
+      [oldA, oldB].map(async (ref) => (await app.getExecution(ref)) !== null),
+    );
+    return found.filter(Boolean).length;
+  };
+  const eventNames = async (): Promise<string[]> => {
+    const { rows } = await pool.query(
+      `select name from otra.e_${young.queueId.replaceAll("-", "")}
+        order by name`,
+    );
+    return rows.map((row: { name: string }) => row.name);
+  };
+
+  // No ttl argument: the queue policy's 30 days applies, nothing is due.
+  await app.cleanup();
+  assert.equal(await survivors(), 2);
+  assert.deepEqual(await eventNames(), ["fresh-fact", "stale-fact"]);
+
+  // limit bounds the batch, so only one of the two due trees goes.
+  await app.cleanup("orders", { ttl: "1 day", limit: 1 });
+  assert.equal(await survivors(), 1);
+
+  await app.cleanup("orders", { ttl: "1 day" });
+  assert.equal(await survivors(), 0);
+  assert.equal((await app.getExecution(young))!.status, "completed");
+  assert.deepEqual(await eventNames(), ["fresh-fact"]);
 });
 
 test("queue tables enforce root ownership and cascade complete trees", async () => {

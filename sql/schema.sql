@@ -621,6 +621,58 @@ begin
 end;
 $$ language plpgsql;
 
+-- Drop a queue and every physical relation derived from its UUID.  The queue
+-- row is locked FOR UPDATE *before* any DDL: that conflicts with the FOR KEY
+-- SHARE barrier every hot path takes first, so no in-flight spawn/claim can
+-- still be holding resolved table names across the drop.  Non-terminal
+-- executions refuse the drop unless p_force -- their workers would otherwise
+-- fail with "relation does not exist" mid-replay.
+create or replace function otra.drop_queue (
+  p_name text, p_force boolean default false
+) returns void as $$
+declare
+  v_queue_id uuid;
+  v_mode text;
+  v_storage text;
+  v_x text;
+  v_live int;
+begin
+  select q.id, q.storage_mode into v_queue_id, v_mode
+    from otra.queues q
+   where q.name = p_name
+     for update;
+  if not found then
+    raise exception 'Queue "%" does not exist', p_name;
+  end if;
+  v_storage := replace(v_queue_id::text, '-', '');
+  v_x := 'x_' || v_storage;
+
+  if not p_force and to_regclass('otra.' || v_x) is not null then
+    execute format(
+      'select count(*)::int from otra.%I
+        where status not in (''completed'', ''failed'', ''cancelled'')',
+      v_x
+    ) into v_live;
+    if v_live > 0 then
+      raise exception
+        'Queue "%" still has % non-terminal execution(s); pass force to drop it anyway',
+        p_name, v_live using errcode = 'OT003';
+    end if;
+  end if;
+
+  -- Promise storage first: its foreign keys point at the execution table.
+  -- CASCADE also takes every attached partition of a partitioned queue.
+  execute format('drop table if exists otra.%I cascade', 'p_' || v_storage);
+  execute format('drop table if exists otra.%I cascade', v_x);
+  execute format('drop table if exists otra.%I cascade', 'e_' || v_storage);
+  if v_mode = 'partitioned' then
+    execute format('drop table if exists otra.%I cascade', 'i_' || v_storage);
+  end if;
+
+  delete from otra.queues where id = v_queue_id;
+end;
+$$ language plpgsql;
+
 create or replace function otra.get_queue (p_name text)
 returns table (name text, storage_mode text) as $$
   select q.name, q.storage_mode from otra.queues q where q.name = p_name;
@@ -807,6 +859,17 @@ $$ language plpgsql;
 
 -- Discover old empty partitions. Detach itself remains a top-level operator
 -- action because PostgreSQL cannot run DETACH PARTITION CONCURRENTLY here.
+--
+-- The result is ADVISORY: emptiness is observed, not locked.  Each queue row
+-- is taken FOR KEY SHARE (the same barrier every queue-local function takes,
+-- so partition maintenance -- which holds FOR UPDATE -- cannot reshape the
+-- partition set underneath the scan), but nothing stops a spawn from landing
+-- a row in a listed partition the moment this returns.  The caller's DETACH
+-- must be prepared to find the partition non-empty and skip it.
+--
+-- Both halves of a week's pair are listed together.  A promise partition
+-- whose execution sibling is ALREADY detached (or absent) is listed on its
+-- own, when empty and old enough: nothing else would ever mention it again.
 create or replace function otra.list_detach_candidates (p_name text default null)
 returns table (queue_name text, parent_table text, partition_table text) as $$
 declare
@@ -824,6 +887,7 @@ declare
   v_x_has_rows boolean;
   v_p_has_rows boolean;
   v_p_attached boolean;
+  v_x_attached boolean;
   v_storage text;
 begin
   if p_name is not null and not exists (select 1 from otra.queues where name = p_name) then
@@ -838,6 +902,10 @@ begin
        and (p_name is null or q.name = p_name)
      order by q.name
   loop
+    -- The queue barrier every other queue-local function takes first: this
+    -- scan reads the queue's physical layout, so it must not race partition
+    -- maintenance (which holds the same row FOR UPDATE while it does DDL).
+    perform 1 from otra.queues q where q.id = v_queue.id for key share;
     v_storage := replace(v_queue.id::text, '-', '');
     v_x_parent := 'x_' || v_storage;
     v_p_parent := 'p_' || v_storage;
@@ -907,6 +975,58 @@ begin
       return next;
       queue_name := v_queue.name;
       parent_table := v_x_parent;
+      partition_table := v_partition.name;
+      return next;
+    end loop;
+
+    -- Orphans: promise partitions whose execution sibling is already gone
+    -- from the parent.  The pair walk above cannot see them (it is driven by
+    -- the x side), so without this they would never be listed again.
+    for v_partition in
+      select child.relname as name,
+             pg_get_expr(child.relpartbound, child.oid) as bound
+        from pg_inherits i
+        join pg_class child on child.oid = i.inhrelid
+       where i.inhparent = v_p_parent_oid
+    loop
+      if v_partition.bound = 'DEFAULT' then
+        continue;
+      end if;
+      v_suffix := substring(v_partition.name from length(v_p_parent) + 1);
+      select exists (
+        select 1
+          from pg_inherits i
+          join pg_class child on child.oid = i.inhrelid
+         where i.inhparent = v_x_parent_oid
+           and child.relname = v_x_parent || v_suffix
+      ) into v_x_attached;
+      if v_x_attached then
+        continue; -- paired: already reported by the walk above
+      end if;
+
+      select (regexp_match(
+        v_partition.bound,
+        'TO \(''([^'']+)''(::uuid)?\)'
+      ))[1]::uuid into v_upper;
+      if v_upper is null then
+        continue;
+      end if;
+      v_upper_at := otra.uuid_v7_timestamp(v_upper);
+      if v_upper_at is null
+         or v_upper_at >= v_now - v_queue.detach_min_age then
+        continue;
+      end if;
+
+      execute format(
+        'select exists (select 1 from otra.%I limit 1)',
+        v_partition.name
+      ) into v_p_has_rows;
+      if v_p_has_rows then
+        continue;
+      end if;
+
+      queue_name := v_queue.name;
+      parent_table := v_p_parent;
       partition_table := v_partition.name;
       return next;
     end loop;
@@ -1501,6 +1621,7 @@ declare
   v_x text;
   v_p text;
   v_existing uuid;
+  v_kind text;
   v_id uuid := otra.uuid_v7();
   v_delay double precision := coalesce((p_opts ->> 'delay_s')::double precision, 0);
   v_strategy jsonb := coalesce(
@@ -1517,13 +1638,22 @@ begin
   v_x := 'x_' || v_storage;
   v_p := 'p_' || v_storage;
   execute format(
-    'select child_execution_id from otra.%I
+    'select kind, child_execution_id from otra.%I
       where root_id = $1 and execution_id = $2 and key = $3',
     v_p
-  ) into v_existing using p_root, p_parent, p_key;
-  if v_existing is not null then
-    return query select p_queue, p_root, v_existing, false;
-    return;
+  ) into v_kind, v_existing using p_root, p_parent, p_key;
+  -- 'kind' is NOT NULL, so a null here means no row: the key is free.
+  if v_kind is not null then
+    if v_kind = 'child' and v_existing is not null then
+      return query select p_queue, p_root, v_existing, false;
+      return;
+    end if;
+    -- The key is occupied by a different kind of journal entry.  Falling
+    -- through would surface a bare 23505 from the unique index; say what
+    -- actually went wrong instead (a determinism violation at this key).
+    raise exception
+      'promise key "%" already exists with kind "%"; spawning a child there would diverge from the recorded history',
+      p_key, v_kind using errcode = 'OT003';
   end if;
   execute format(
     'insert into otra.%I
@@ -1687,9 +1817,13 @@ begin
 end;
 $$ language plpgsql;
 
+-- Emit the one-shot fact (queue, name).  Returns true when THIS call created
+-- it, false when the name was already a fact and the call changed nothing --
+-- including its payload, which is never overwritten (first write wins).
+drop function if exists otra.emit_event_local (text, text, jsonb);
 create or replace function otra.emit_event_local (
   p_queue text, p_name text, p_payload jsonb default null
-) returns void as $$
+) returns boolean as $$
 declare
   v_queue_id uuid;
   v_storage text;
@@ -1712,7 +1846,7 @@ begin
      on conflict (name) do nothing returning id',
     v_e
   ) into v_event_id using p_name, p_payload;
-  if v_event_id is null then return; end if;
+  if v_event_id is null then return false; end if;
   for v_woken in execute format(
     'with settled as (
        update otra.%I
@@ -1725,21 +1859,23 @@ begin
   ) using p_payload, p_name loop
     perform otra._wake_local(v_queue_id, v_woken.root_id, v_woken.owners);
   end loop;
+  return true;
 end;
 $$ language plpgsql;
 
+drop function if exists otra.get_promises_local (uuid, uuid, uuid, text[]);
 create or replace function otra.get_promises_local (
   p_queue uuid, p_root uuid, p_execution uuid, p_keys text[]
 ) returns table (
-  id uuid, key text, kind text, status text, value jsonb, error jsonb,
-  child_execution_id uuid
+  id uuid, key text, label text, kind text, status text, value jsonb,
+  error jsonb, child_execution_id uuid
 ) as $$
 declare v_p text := 'p_' || replace(p_queue::text, '-', '');
 begin
   perform 1 from otra.queues q where q.id = p_queue for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
   return query execute format(
-    'select p.id, p.key, p.kind, p.status, p.value, p.error,
+    'select p.id, p.key, p.label, p.kind, p.status, p.value, p.error,
             p.child_execution_id
        from otra.%I p
       where p.root_id = $1 and p.execution_id = $2 and p.key = any ($3)',
@@ -1804,9 +1940,30 @@ begin
 end;
 $$ language plpgsql;
 
+-- Settle one external promise from outside the owning execution.  The
+-- outcome is reported as text so callers can tell the two very different
+-- misses apart: 'already_settled' is an ordinary lost race against a
+-- write-once register, while 'not_external' means the id names nothing, or
+-- names a journal row the single-author rule forbids outsiders to touch.
+create or replace function otra._settled_promise_outcome (
+  p_p text, p_root uuid, p_id uuid
+) returns text as $$
+declare
+  v_kind text;
+begin
+  execute format(
+    'select kind from otra.%I where root_id = $1 and id = $2',
+    p_p
+  ) into v_kind using p_root, p_id;
+  if v_kind is distinct from 'external' then return 'not_external'; end if;
+  return 'already_settled';
+end;
+$$ language plpgsql;
+
+drop function if exists otra.resolve_promise_local (uuid, uuid, uuid, jsonb);
 create or replace function otra.resolve_promise_local (
   p_queue uuid, p_root uuid, p_id uuid, p_value jsonb
-) returns boolean as $$
+) returns text as $$
 declare
   v_p text := 'p_' || replace(p_queue::text, '-', '');
   v_owner uuid;
@@ -1821,15 +1978,18 @@ begin
       returning execution_id',
     v_p
   ) into v_owner using p_value, p_root, p_id;
-  if v_owner is null then return false; end if;
+  if v_owner is null then
+    return otra._settled_promise_outcome(v_p, p_root, p_id);
+  end if;
   perform otra._wake_local(p_queue, p_root, array[v_owner]);
-  return true;
+  return 'resolved';
 end;
 $$ language plpgsql;
 
+drop function if exists otra.reject_promise_local (uuid, uuid, uuid, jsonb);
 create or replace function otra.reject_promise_local (
   p_queue uuid, p_root uuid, p_id uuid, p_error jsonb
-) returns boolean as $$
+) returns text as $$
 declare
   v_p text := 'p_' || replace(p_queue::text, '-', '');
   v_owner uuid;
@@ -1844,9 +2004,11 @@ begin
       returning execution_id',
     v_p
   ) into v_owner using p_error, p_root, p_id;
-  if v_owner is null then return false; end if;
+  if v_owner is null then
+    return otra._settled_promise_outcome(v_p, p_root, p_id);
+  end if;
   perform otra._wake_local(p_queue, p_root, array[v_owner]);
-  return true;
+  return 'rejected';
 end;
 $$ language plpgsql;
 
