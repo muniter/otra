@@ -17,8 +17,12 @@
     "sql"
   ],
   "scripts": {
+    "prepare-assets": "node scripts/prepare-assets.mjs",
+    "prebuild": "npm run prepare-assets",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
+    "pretest": "npm run prepare-assets",
+    "prepack": "npm run build",
     "test": "node --experimental-strip-types --test --test-concurrency=1 --test-global-setup=tests/global-setup.ts tests/*.test.ts"
   },
   "dependencies": {

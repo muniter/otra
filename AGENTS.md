@@ -5,7 +5,8 @@ durable promises**. Tasks are TypeScript generator functions; every
 suspension point (`yield*`) is a write-once promise row in Postgres; recovery
 replays the generator from the top, fast-forwarding through the memoized
 history ("¡otra!" — again). All coordination logic lives in stored functions
-(`sql/schema.sql`); the SDK (`src/`) is a thin replay driver.
+(`sql/schema.sql`); the TypeScript SDK (`sdks/typescript/src/`) is a thin
+replay driver.
 
 Read `README.md` first for the user-facing model. This file is for you: the
 invariants you must not break, how this repo is developed, the reference
@@ -38,7 +39,8 @@ systems, and the decisions already made so you don't relitigate them.
    order: `suspend()` locks the execution row before checking blockers;
    resolvers lock promise row first, execution row second; `_wake` locks
    executions in id order. Proven under forced contention in
-   `tests/locking.test.ts` — extend those tests if you touch lock order.
+   `sdks/typescript/tests/locking.test.ts` — extend those tests if you touch
+   lock order.
 6. **Ownership guards on every history write.** `_assert_owner` raises
    sqlstate `OT001` (claim lost/zombie) or `OT002` (killed) on
    `record_run`/`create_sleep`/`create_event_wait`/`create_external`/
@@ -66,11 +68,12 @@ systems, and the decisions already made so you don't relitigate them.
 - **TDD is the house rule.** Every behavior change lands as a failing test
   first; run it red, implement, run the full suite. Regression tests cite
   what motivated them (several cite absurd commits — keep that habit).
-- **Tests run against real Postgres.** `npm test` starts a
+- **Tests run against real Postgres.** `make test` starts a
   session-scoped Postgres 16 Testcontainer. Set
   `OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres` to use an
   existing database instead. Each test drops and re-applies the `otra`
-  schema. Commands: `npm test`, `npm run typecheck`, `npx prettier --write`.
+  schema. Root commands are `make install`, `make check`, `make build`, and
+  `make test`.
 - **Local Postgres quickstart** (any PG ≥ 14; as root you must run it as the
   postgres user):
   ```sh
@@ -86,12 +89,14 @@ systems, and the decisions already made so you don't relitigate them.
   with `worker.tick()` / `worker.drain()` — never `sleep()` and hope.
 - **Gates, not sleeps:** async coordination in tests uses `EventEmitter` +
   `once(gate, "release")` rendezvous (a pattern taken from absurd's TS
-  suite) and a `waitFor(condition)` poller (`tests/helpers.ts`).
+  suite) and a `waitFor(condition)` poller
+  (`sdks/typescript/tests/helpers.ts`).
 - **Race tests:** force the interleaving with two `pg.Client`s — session A
   holds a row lock in an open transaction, session B blocks, the test
   *observes* the block via `pg_stat_activity.wait_event_type = 'Lock'`,
-  then commits A and asserts convergence. See `tests/locking.test.ts` and
-  the cancel-vs-suspend test. Use this for any new concurrency claim.
+  then commits A and asserts convergence. See
+  `sdks/typescript/tests/locking.test.ts` and the cancel-vs-suspend test. Use
+  this for any new concurrency claim.
 
 ## References: keep these within reach
 

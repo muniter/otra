@@ -7,8 +7,17 @@ durable promises. It began as an experimental sibling of
 [absurd](https://github.com/earendil-works/absurd) and keeps its philosophy —
 all coordination logic lives in Postgres stored functions, the SDK stays
 thin — rebuilt around **durable promises** and a **generator-based API**.
-TypeScript-only and self-contained: its own [`sql/schema.sql`](sql/schema.sql),
-its own SDK, its own tests.
+The coordination engine lives in [`sql/schema.sql`](sql/schema.sql), and the
+current SDK lives in [`sdks/typescript`](sdks/typescript). The repository keeps
+language SDKs independently buildable so more runtimes and operator tools can
+be added without coupling their toolchains. Standalone operator applications
+belong under `apps/<name>` when introduced.
+
+```text
+sql/                 Postgres coordination engine
+sdks/typescript/     TypeScript SDK, tests, and examples
+docs/                Design documentation
+```
 
 The design follows Jack Vanlightly's *Theory of Durable Execution* series,
 which is the best available explanation of the primitives involved:
@@ -109,7 +118,8 @@ await app.spawn(orderFulfillment, order);
 app.startWorker();
 ```
 
-The complete runnable version is [`examples/order.ts`](examples/order.ts).
+The complete runnable version is
+[`sdks/typescript/examples/order.ts`](sdks/typescript/examples/order.ts).
 
 ### Context API
 
@@ -220,18 +230,20 @@ Two details worth stealing even if you throw the rest away:
 
 ## Testing
 
-Tests are plain `node:test` against a real Postgres. `npm test` starts a
+Tests are plain `node:test` against a real Postgres. `make test` starts a
 Postgres 16 Testcontainer, while `OTRA_TEST_DB` can point the suite at an
 existing Postgres 14 or newer. Database time is frozen via
 `otra.set_fake_now()` (stored in a table, not a GUC, so every pooled
 connection sees the same fake clock — no `max: 1` workaround needed):
 
 ```bash
-# Start an isolated Postgres 16 container with Docker.
-npm test
+# Install the TypeScript SDK dependencies, then start an isolated Postgres 16
+# container with Docker.
+make install
+make test
 
 # Or use an existing database; tests drop/recreate the otra schema.
-OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres npm test
+OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres make test
 ```
 
 The suite covers memoization across suspension, replay determinism, the

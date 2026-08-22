@@ -3,7 +3,8 @@
 Status: **v1 and v2 core implemented** — suspending compensation via the
 journaled `$cancel` delivery-point row landed without needing a `cancelling`
 status (the flag column + journal row carry the state; see
-tests/compensation.test.ts). Remaining tiers: leaf-first finalization,
+sdks/typescript/tests/compensation.test.ts). Remaining tiers: leaf-first
+finalization,
 preemptible runs, pause/resume. This documents how production
 durable-execution engines handle cancellation of running executions, and the
 design otra should adopt. Compiled from primary sources (official docs,
