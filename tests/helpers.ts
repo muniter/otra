@@ -3,7 +3,8 @@ import pg from "pg";
 import { Otra } from "../src/index.ts";
 
 /**
- * The tests need a real Postgres.  Point OTRA_TEST_DB at one, e.g.:
+ * The global test setup starts Postgres with Testcontainers. Point
+ * OTRA_TEST_DB at an existing database to bypass the container, e.g.:
  *   OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres npm test
  * The otra schema in that database is dropped and recreated per test.
  */

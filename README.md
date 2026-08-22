@@ -220,12 +220,17 @@ Two details worth stealing even if you throw the rest away:
 
 ## Testing
 
-Tests are plain `node:test` against a real Postgres, with database time
-frozen via `otra.set_fake_now()` (stored in a table, not a GUC, so every
-pooled connection sees the same fake clock — no `max: 1` workaround needed):
+Tests are plain `node:test` against a real Postgres. `npm test` starts a
+Postgres 16 Testcontainer, while `OTRA_TEST_DB` can point the suite at an
+existing Postgres 14 or newer. Database time is frozen via
+`otra.set_fake_now()` (stored in a table, not a GUC, so every pooled
+connection sees the same fake clock — no `max: 1` workaround needed):
 
 ```bash
-# any Postgres >= 14 works; tests drop/recreate the otra schema
+# Start an isolated Postgres 16 container with Docker.
+npm test
+
+# Or use an existing database; tests drop/recreate the otra schema.
 OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres npm test
 ```
 

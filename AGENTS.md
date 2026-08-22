@@ -66,9 +66,10 @@ systems, and the decisions already made so you don't relitigate them.
 - **TDD is the house rule.** Every behavior change lands as a failing test
   first; run it red, implement, run the full suite. Regression tests cite
   what motivated them (several cite absurd commits — keep that habit).
-- **Tests run against real Postgres**, no mocks, no testcontainers:
-  `OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres npm test`
-  (default DSN is exactly that). Each test drops and re-applies the `otra`
+- **Tests run against real Postgres.** `npm test` starts a
+  session-scoped Postgres 16 Testcontainer. Set
+  `OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres` to use an
+  existing database instead. Each test drops and re-applies the `otra`
   schema. Commands: `npm test`, `npm run typecheck`, `npx prettier --write`.
 - **Local Postgres quickstart** (any PG ≥ 14; as root you must run it as the
   postgres user):
@@ -159,17 +160,15 @@ propagate up, cancellations propagate down the tree"):
 
 1. LISTEN/NOTIFY wakeups — the SQL already emits `otra_wake` /
    `pg_notify`; workers still poll. Also removes `getResult` polling.
-2. CI: GitHub Action with a `postgres:16` service container running
-   typecheck + the suite.
-3. Cancellation remaining tiers: leaf-first finalization (parent waits for
+2. Cancellation remaining tiers: leaf-first finalization (parent waits for
    descendants before compensating), preemptible runs (AbortSignal into the
    step fn, result discarded — DBOS-style), operator pause/resume as a
    distinct `paused` status (sound only because compensation didn't run).
-4. `TaskError` rename/cleanup (watchlist: exists only to mark
+3. `TaskError` rename/cleanup (watchlist: exists only to mark
    non-retryable; consider `NonRetryableError`).
-5. History growth: no continue-as-new equivalent yet; long-looping tasks
+4. History growth: no continue-as-new equivalent yet; long-looping tasks
    replay O(history).
-6. npm publish (the name `otra` was free as of 2026-08).
+5. npm publish (the name `otra` was free as of 2026-08).
 
 ## Sharp edges to keep in mind
 
