@@ -94,7 +94,10 @@ import { Otra } from "otra";
 const app = new Otra({ db: process.env.DATABASE_URL, queue: "orders" });
 
 const processPayment = app.task("process-payment", function* (params: { amount: number }, ctx) {
-  return yield* ctx.run("charge", () => stripe.charges.create({ amount: params.amount }));
+  return yield* ctx.run("charge", async () => {
+    const charge = await stripe.charges.create({ amount: params.amount });
+    return { chargeId: charge.id };
+  });
 });
 
 const orderFulfillment = app.task("order-fulfillment", function* (params: Order, ctx) {
@@ -110,7 +113,9 @@ const orderFulfillment = app.task("order-fulfillment", function* (params: Order,
     timeout: "30d",
   });
 
-  yield* ctx.run("notify", () => sendEmail(params.email, shipment));
+  yield* ctx.run("notify", async () => {
+    await sendEmail(params.email, shipment);
+  });
   return { chargeId: charge.chargeId, tracking: shipment.trackingNumber };
 });
 
@@ -127,7 +132,9 @@ Everything is consumed with `yield*`, which is what threads the result types
 through:
 
 - `ctx.run(label, fn)` — checkpoint a side effect; `fn` runs at most once per
-  recorded result. A throw fails the attempt and the task retries (recorded
+  recorded result and must return a `JsonValue`. Project rich SDK responses
+  into plain JSON objects. A callback with no return value is recorded and
+  typed as `null`. A throw fails the attempt and the task retries (recorded
   steps are skipped on replay).
 - `ctx.sleep("5m")` — durable timer. Accepts `ms/s/m/h/d` strings or seconds.
 - `ctx.waitForEvent(name, { timeout? })` — suspend until the event is emitted

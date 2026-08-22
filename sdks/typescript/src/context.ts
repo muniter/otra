@@ -44,6 +44,13 @@ function* op<T>(effect: Effect): Op<T> {
   return (yield effect) as T;
 }
 
+type RunResult<T> = [Awaited<T>] extends [void] ? null : Awaited<T>;
+type RunReturnConstraint<T> = [Awaited<T>] extends [void]
+  ? unknown
+  : Awaited<T> extends JsonValue
+    ? unknown
+    : never;
+
 /**
  * The durable context passed to every task handler.  All methods return
  * generators and must be consumed with `yield*`; the yielded effects are
@@ -106,10 +113,16 @@ export class Ctx {
   /**
    * Checkpoint a local side effect.  `fn` runs at most once per recorded
    * result: on replay the memoized value is injected without re-executing.
-   * If `fn` throws, the current attempt fails and the whole task retries
-   * (already-checkpointed steps are skipped on the next attempt).
+   * Results must be JSON values because they are persisted in Postgres and
+   * injected from that serialized history on replay. A callback with no
+   * return value is persisted and typed as null. If `fn` throws, the current
+   * attempt fails and the whole task retries (already-checkpointed steps are
+   * skipped on the next attempt).
    */
-  run<T>(label: string, fn: () => T | Promise<T>): Op<Awaited<T>> {
+  run<T>(
+    label: string,
+    fn: () => T & RunReturnConstraint<T>,
+  ): Op<RunResult<T>> {
     return op({ type: "run", label, fn });
   }
 
