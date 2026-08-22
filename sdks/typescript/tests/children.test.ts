@@ -25,28 +25,29 @@ test("parent suspends while awaiting a same-queue child, then resumes", async ()
     return { doubled };
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   const worker = app.createWorker({ workerId: "w1" });
 
   // Tick 1 claims only the parent; it spawns the child and parks.  This is
   // the thing absurd cannot do: the parent holds no worker slot, no claim,
   // and same-queue waits cannot deadlock.
   assert.equal(await worker.tick(), 1);
-  const parked = (await app.getExecution(executionId))!;
+  const parked = (await app.getExecution(execution))!;
   assert.equal(parked.status, "suspended");
 
+  const table = `otra.x_${execution.queueId.replaceAll("-", "")}`;
   const { rows: children } = await pool.query(
-    "select id, parent_id, root_id, status from otra.executions where function_name = 'double'",
+    `select id, parent_id, root_id, status from ${table} where function_name = 'double'`,
   );
   assert.equal(children.length, 1);
-  assert.equal(children[0].parent_id, executionId);
-  assert.equal(children[0].root_id, executionId);
+  assert.equal(children[0].parent_id, execution.executionId);
+  assert.equal(children[0].root_id, execution.executionId);
 
   // Tick 2 runs the child; completion resolves the parent's child-promise
   // and wakes it.  Tick 3 replays the parent to completion.
   assert.equal(await worker.tick(), 1);
   assert.equal(await worker.tick(), 1);
-  assert.deepEqual(await app.getResult(executionId), { doubled: 42 });
+  assert.deepEqual(await app.getResult(execution), { doubled: 42 });
 });
 
 test("fan-out: ctx.all awaits several children in order", async () => {
@@ -64,11 +65,11 @@ test("fan-out: ctx.all awaits several children in order", async () => {
     return [a, b, c];
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
 
-  assert.deepEqual(await app.getResult(executionId), [4, 9, 16]);
+  assert.deepEqual(await app.getResult(execution), [4, 9, 16]);
 });
 
 test("replay never duplicates children", async () => {
@@ -90,7 +91,7 @@ test("replay never duplicates children", async () => {
     return value;
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
   await env.advance(31);
@@ -98,9 +99,11 @@ test("replay never duplicates children", async () => {
   await env.advance(31);
   await worker.drain();
 
-  assert.equal(await app.getResult(executionId), 1);
+  assert.equal(await app.getResult(execution), 1);
   const { rows } = await pool.query(
-    "select count(*)::int as n from otra.executions where function_name = 'once'",
+    `select count(*)::int as n
+       from otra.x_${execution.queueId.replaceAll("-", "")}
+      where function_name = 'once'`,
   );
   assert.equal(rows[0].n, 1);
   assert.equal(childRuns, 1);
@@ -138,11 +141,11 @@ test("a failed child rejects the parent's await with ChildFailedError", async ()
 
   const a = await app.spawn(catching, null);
   await worker.drain();
-  assert.equal(await app.getResult(a.executionId), "caught: child exploded");
+  assert.equal(await app.getResult(a), "caught: child exploded");
 
   const b = await app.spawn(uncaught, null, { maxAttempts: 5 });
   await worker.drain();
-  const snapshot = (await app.getExecution(b.executionId))!;
+  const snapshot = (await app.getExecution(b))!;
   assert.equal(snapshot.status, "failed");
   // The rejection is memoized, so retrying the parent could never help:
   // it failed on its first attempt despite maxAttempts = 5.
@@ -161,10 +164,10 @@ test("ctx.call is spawn + await", async () => {
     return yield* ctx.call(shout, { word: "quiet" });
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
-  assert.equal(await app.getResult(executionId), "QUIET");
+  assert.equal(await app.getResult(execution), "QUIET");
 });
 
 test("grandchildren: failures are contained to their branch", async () => {
@@ -197,8 +200,8 @@ test("grandchildren: failures are contained to their branch", async () => {
     return yield* ctx.call(mid, null);
   });
 
-  const { executionId } = await app.spawn(root, null);
+  const execution = await app.spawn(root, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
-  assert.deepEqual(await app.getResult(executionId), ["bad-failed", "ok"]);
+  assert.deepEqual(await app.getResult(execution), ["bad-failed", "ok"]);
 });

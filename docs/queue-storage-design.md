@@ -1,11 +1,9 @@
 # Queue Storage Design
 
-Status: **accepted direction; implementation in progress**
+Status: **implemented**
 
-otra currently treats a queue as a routing label on shared `executions` and
-`events` tables. This document evaluates making queues explicit storage,
-retention, and execution-tree boundaries, following the production-hardened
-shape used by absurd.
+otra treats queues as explicit storage, retention, and execution-tree
+boundaries, following the production-hardened shape used by absurd.
 
 ## Motivation
 
@@ -26,7 +24,7 @@ Production storage needs:
 Partitioned queues use the same execution-tree identity and promise ownership
 model as unpartitioned queues. Storage mode is immutable after provisioning.
 
-## Current Storage
+## Previous Storage
 
 The schema has four fixed tables:
 
@@ -84,7 +82,7 @@ Primary references in the local checkout:
 - `/tmp/absurd/tests/test_partition_detach.py`
 - `/tmp/absurd/tests/test_partition_utils.py`
 
-## Proposed Invariants
+## Target Invariants
 
 1. Every queue is explicitly provisioned in `otra.queues`.
 2. Every execution tree belongs to exactly one queue.
@@ -103,7 +101,7 @@ Cross-queue coordination remains possible outside a durable tree: application
 code can observe one terminal result and spawn a new top-level execution on a
 different queue. A task cannot durably await a child owned by another queue.
 
-## Proposed Physical Layout
+## Physical Layout
 
 Each queue owns three table families:
 
@@ -163,13 +161,13 @@ uses UUIDv7 range partitions based on `root_id`:
 
 ```text
 x_<queue-id>
-├── x_<queue-id>_634
-├── x_<queue-id>_635
+├── x_<queue-id>_202601
+├── x_<queue-id>_202602
 └── x_<queue-id>_d
 
 p_<queue-id>
-├── p_<queue-id>_634
-├── p_<queue-id>_635
+├── p_<queue-id>_202601
+├── p_<queue-id>_202602
 └── p_<queue-id>_d
 ```
 
@@ -217,6 +215,183 @@ before touching physical tables. Policy changes lock that row for update,
 forming a maintenance barrier, and acquire partition parents before leaf
 partitions.
 
+Dynamic coordination follows absurd's proven identifier/value split:
+
+- derive relation names from the persisted queue UUID
+- interpolate identifiers only through `format(... %I ...)`
+- bind every UUID, timestamp, worker ID, key, and JSON value through
+  `EXECUTE ... USING`
+- keep each state transition inside one stored-function transaction
+- order contested rows deterministically before `FOR UPDATE`
+- use bounded `SKIP LOCKED` sweeps for queue maintenance
+
+Unlike absurd, public coordination functions resolve a provisioned queue
+before deriving relations. Missing queues therefore produce one stable error
+instead of relation-not-found errors from scattered dynamic statements.
+
+## Coordination Routing Contract
+
+Runtime coordination uses the provisioned table families throughout. The
+cutover spans spawn, claim, replay, history writes, suspension, settlement,
+events, cancellation, inspection, and cleanup; there is no shared-table
+fallback.
+
+A queue-local execution is addressed internally by:
+
+```typescript
+interface ExecutionRoute {
+  queueId: string;
+  rootId: string;
+  executionId: string;
+}
+```
+
+Each field is load-bearing:
+
+- `queueId` selects the physical table family without depending on a mutable
+  queue label.
+- `rootId` selects the partition and participates in every composite key.
+- `executionId` selects the execution inside its tree.
+
+Queue names remain user-facing routing labels for top-level spawn, worker
+claim, and event emission. SQL resolves the label once and returns the stable
+queue ID. After claim, the worker and replay driver carry `ExecutionRoute`
+through every database call instead of repeatedly rediscovering it.
+
+Top-level roots are inserted atomically with `id = root_id`; the current
+insert-then-update pattern is invalid for partitioned storage. `claim()` returns
+`queue_id` and `root_id` with each execution. Child spawn receives the parent's
+route and derives queue and root in PostgreSQL.
+
+The recommended public execution reference is the serializable route itself:
+
+```typescript
+interface ExecutionRef {
+  queueId: string;
+  rootId: string;
+  executionId: string;
+}
+```
+
+`app.spawn()` returns an `ExecutionRef`; inspection, result, cancel, and kill
+accept it. This avoids a global `execution_id -> queue_id, root_id` routing
+registry and guarantees partition-pruned access. Durable child handles retain
+the same routing fields internally. `ctx.executionId` remains the execution
+UUID, while database coordination uses the full route.
+
+Task definitions do not own queues. Queue selection belongs to the app or a
+top-level spawn. Child spawn options omit `queue` and `idempotencyKey`; children
+always inherit their parent's queue and root.
+
+## Coordination Module
+
+PostgreSQL remains the deep coordination module. Its internal routing helper
+resolves a stable queue ID, acquires the metadata lock, and derives `x`, `p`,
+`e`, and `i` relation names. Public stored functions hide relation naming,
+partition keys, lock ordering, retries, and wakeups from every SDK.
+
+Hot coordination uses a queue metadata `FOR KEY SHARE` lock before touching a
+physical table. Policy, drop, and partition maintenance use `FOR UPDATE`. This
+barrier prevents maintenance from changing or detaching storage while a
+coordination transaction is using it; compatible hot operations still run
+concurrently.
+
+The routing helper has two entry seams:
+
+```text
+queue label -> stable queue route   spawn, claim, emit
+queue ID    -> stable queue route   replay, settlement, inspection
+```
+
+It returns fixed UUID-derived relation names. Coordination functions then build
+one dynamic statement where practical instead of exposing table names to the
+TypeScript SDK.
+
+## Coordination Matrix
+
+| Area | Current address | Queue-local change |
+| --- | --- | --- |
+| Top-level spawn | queue name | Resolve queue; pre-generate `id = root_id`; use `i_*` for partitioned idempotency. |
+| Child spawn | caller queue + parent ID | Accept parent route; derive queue/root; memoize through the parent `p_*` row. |
+| Claim and sweeps | queue name | Operate directly on local `x_*`/`p_*`; return queue/root; preserve bounded `SKIP LOCKED`. |
+| Replay reads | execution ID | Query `p_*` by `(root_id, execution_id)` using the execution route. |
+| History writes | execution ID + worker | Route-aware `_assert_owner`; insert root on every promise; preserve write-once rows. |
+| Suspend | execution ID | Lock routed execution, then perform non-locking blocker checks in routed `p_*`. |
+| Promise resolvers | promise ID | Lock routed promise first, then owner executions in UUID order. |
+| Events | queue name | Resolve local `e_*`/`p_*`; retain advisory race lock keyed by queue UUID and event name. |
+| Complete/fail | execution ID + worker | Preserve exact worker ownership, SQL retry calculation, parent promise settlement, and forensic `claimed_by`. |
+| Cancellation/kill | execution ID | Accept execution route; traverse and lock one routed root tree in UUID order. |
+| Inspection/result | execution ID | Accept `ExecutionRef`; no partition scan or global routing registry. |
+| Cleanup | global TTL | Read queue policy; delete bounded eligible roots, `i_*` mappings, and old `e_*` facts. |
+
+## Lock Protocol
+
+Queue routing adds one outer lock without changing otra's proven inner
+protocols:
+
+```text
+queue metadata barrier
+  -> event advisory lock, when applicable
+  -> existing execution/promise row protocol
+```
+
+Load-bearing row orders remain:
+
+- history creation: owner execution row, then promise insertion
+- resolvers: promise row, then owner execution rows in UUID order
+- suspension: owner execution row, then non-locking blocker status checks
+- tree cancellation/kill: all selected execution rows in UUID order
+
+Expired claims continue through the ordinary failure transition rather than
+silently resetting ownership. All timer, timeout, claim-expiry, and runnable
+claim sweeps remain bounded and use deterministic tie-breaking. Forced lock
+tests must observe blocking through `pg_stat_activity` before releasing gates.
+
+The most relevant absurd lessons are:
+
+- `47e6710`: claim expiry is an attempt failure
+- `bcde0df`: event wait registration must serialize against emit
+- `300a5c2`: competing terminal transitions share one lock order
+- `7b63b7a`: events are immutable first-write-wins facts
+- `9c5388e`: idempotency conflict lookup locks against concurrent cleanup and
+  raises `40001` if the canonical execution disappears
+- `866480d`: retry policies are validated at spawn and poison rows cannot wedge
+  claim maintenance
+
+## Cutover Tracer
+
+The smallest functioning end-to-end tracer is an effect-free task:
+
+```text
+app.spawn
+  -> queue-local root insert
+worker.claim
+  -> queue-local claim returning ExecutionRoute
+driver.loadHistory
+  -> empty queue-local promise history
+driver.complete
+  -> queue-local terminal execution
+app.getResult
+  -> routed terminal inspection
+```
+
+This tracer deliberately includes more than spawn and claim. It proves the
+route can cross the SDK/worker/driver seam and that partitioned and
+unpartitioned queues present one coordination interface.
+
+The tracer requires:
+
+1. Queue routing helpers and stable queue-not-found errors.
+2. `ExecutionRef`/`ExecutionRoute` and route-aware SDK database methods.
+3. Top-level spawn with direct `id = root_id` insertion.
+4. Partitioned idempotency reservation and the cleanup race protocol.
+5. Queue-local claim returning `queue_id` and `root_id`.
+6. Route-aware `load_history`, `complete`, and `get_execution`.
+7. Tests proving weekly routing, ownership, idempotency, and both storage modes.
+
+The shared tables and static coordination paths are absent, so incomplete
+routing cannot be masked by a fallback.
+
 ## Expected Performance
 
 No otra benchmark has yet compared these layouts. The expected behavior is:
@@ -247,7 +422,7 @@ Before selecting defaults, benchmark:
 
 ## SDK Shape
 
-A possible TypeScript interface is:
+The target TypeScript interface is:
 
 ```typescript
 await app.createQueue("orders", {
@@ -259,12 +434,14 @@ await app.setQueuePolicy("orders", {
 });
 
 const orders = new Otra({ db, queue: "orders" });
-await orders.spawn(orderTask, params);
+const execution = await orders.spawn(orderTask, params);
+await orders.getResult(execution);
 ```
 
-Top-level spawn selects a provisioned queue. Child spawn options omit `queue`;
-the database derives queue and root from the parent. Task registration should
-not silently move a child to another queue.
+Top-level spawn selects a provisioned queue and returns `ExecutionRef`. Task
+registration describes code rather than storage placement. Child spawn options
+omit `queue` and `idempotencyKey`; PostgreSQL derives queue and root from the
+parent route.
 
 Queue management needs at least:
 
@@ -282,7 +459,7 @@ Queue management needs at least:
 External promise settlement currently addresses a promise by UUID alone. With
 queue-local promise tables, settlement must also locate the queue table.
 
-The preferred direction is a versioned opaque token containing routing data:
+The token is a versioned opaque address containing routing data:
 
 ```text
 queue ID + root_id + promise_id
@@ -291,8 +468,10 @@ queue ID + root_id + promise_id
 The random promise identifier remains the unforgeable capability. Encoding
 routing data avoids an unbounded global token lookup table, which would
 reintroduce shared storage and cleanup pressure. Tokens carry the internal
-queue ID rather than exposing the user-facing queue name. Exact encoding and
-versioning remain open design work.
+queue ID rather than exposing the user-facing queue name. The recommended wire
+shape is `otr1_<base64url(queue UUID || root UUID || promise UUID)>`. Parsing
+returns the route needed for one partition-pruned promise update; no global
+token lookup table is introduced.
 
 ## Implementation Plan
 
@@ -300,27 +479,28 @@ The repository has no migration framework and is not yet published, so this
 should land as a deliberate schema rewrite rather than compatibility layers.
 Each slice follows red-green TDD against real PostgreSQL.
 
-1. Add queue provisioning and validation, with an unpartitioned queue table
-   set and idempotent concurrent creation tests.
-2. Route top-level spawn and claim through provisioned queue tables; reject
-   unknown queues.
-3. Move durable promise creation, replay, suspension, and settlement into the
-   queue table set while preserving ownership and lock-order invariants.
-4. Make child spawn derive queue and root from its parent; remove the child
-   queue option and add database-level cross-queue rejection tests.
-5. Adapt cancellation, event facts, external promises, and execution snapshots
-   to queue-local storage.
-6. Add queue policy and bounded tree-aware cleanup; prove that live descendants
-   block root deletion and that promise history cascades with the tree.
-7. Add partition default management and empty-partition candidate discovery.
-8. Add detach/drop operations and forced-contention tests around active trees.
-9. Benchmark unpartitioned and partitioned queue-local layouts.
-10. Add operator tooling only after the SQL interface and policies stabilize.
+1. Land the effect-free cutover tracer across spawn, claim, replay, completion,
+   and inspection.
+2. Route `_assert_owner`, history reads, and write-once history creation.
+3. Route child spawn with inherited queue/root and split top-level/child option
+   types.
+4. Route bounded timer, timeout, claim-expiry, and retry transitions; add plan
+   regressions for queue-local indexes.
+5. Route suspension, wakeups, child settlement, and external promise tokens;
+   rerun every forced-contention test.
+6. Route event facts and waits while retaining immutable one-shot and no-lost-
+   wakeup semantics.
+7. Route cancellation delivery, kill, compensation finalization, heartbeat,
+   and defer through one execution route.
+8. Replace global cleanup with policy-driven bounded root/event cleanup and
+   remove partitioned idempotency mappings in the same transaction.
+9. Delete shared runtime tables and static coordination paths; run the complete
+   suite against unpartitioned and partitioned queues.
+10. Add detach/drop tooling, benchmarks, and operator scheduling after the
+    coordination interface stabilizes.
 
 ## Open Questions
 
-- What exact table prefixes make operational inspection clearest?
-- What routing data and versioning should external promise tokens contain?
-- Should task registration retain any queue preference, or should only app and
-  top-level spawn configuration select a queue?
 - Which queue policy operations belong in the SDK versus an operator CLI?
+- Should queue labels be immutable now that public execution references route
+  by stable queue ID?

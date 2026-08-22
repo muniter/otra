@@ -3,6 +3,7 @@ import { afterEach, beforeEach, test } from "node:test";
 
 import pg from "pg";
 
+import type { ExecutionRef } from "../src/index.ts";
 import { createTestEnv, waitFor, type TestEnv } from "./helpers.ts";
 
 // Deterministic lock-contention tests, using the technique from absurd's
@@ -49,22 +50,37 @@ async function waitUntilBlockedOnLock(pid: number): Promise<void> {
 }
 
 /** Parent P claimed by w1 with a pending child promise; child C claimed by w2. */
-async function parentAndChild(): Promise<{ parent: string; child: string }> {
+async function parentAndChild(): Promise<{
+  parent: ExecutionRef;
+  child: ExecutionRef;
+}> {
   const { pool } = env;
   const { rows: p } = await pool.query(
-    "select execution_id from otra.spawn('parent-fn', '{}'::jsonb)",
+    "select queue_id, root_id, execution_id from otra.spawn_local('parent-fn', '{}'::jsonb, 'default')",
   );
-  const parent = p[0].execution_id as string;
-  await pool.query("select * from otra.claim('default', 'w1', 30, 1)");
+  const parent: ExecutionRef = {
+    queueId: p[0].queue_id,
+    rootId: p[0].root_id,
+    executionId: p[0].execution_id,
+  };
+  await pool.query("select * from otra.claim_local('default', 'w1', 30, 1)");
   const { rows: c } = await pool.query(
-    "select execution_id from otra.spawn('child-fn', '{}'::jsonb, 'default', '{}', $1, 'child-key', 'child-fn', 'w1')",
-    [parent],
+    `select queue_id, root_id, execution_id
+       from otra.spawn_child_local(
+         $1, $2, $3, 'w1', 'child-key', 'child-fn',
+         'child-fn', '{}'::jsonb
+       )`,
+    [parent.queueId, parent.rootId, parent.executionId],
   );
-  const child = c[0].execution_id as string;
+  const child: ExecutionRef = {
+    queueId: c[0].queue_id,
+    rootId: c[0].root_id,
+    executionId: c[0].execution_id,
+  };
   const { rows: claimed } = await pool.query(
-    "select execution_id from otra.claim('default', 'w2', 30, 1)",
+    "select execution_id from otra.claim_local('default', 'w2', 30, 1)",
   );
-  assert.equal(claimed[0].execution_id, child);
+  assert.equal(claimed[0].execution_id, child.executionId);
   return { parent, child };
 }
 
@@ -75,15 +91,16 @@ test("suspend-then-resolve: a child completing against a parking parent still wa
   // is held, the suspension is not yet visible.
   await a.query("begin");
   const { rows: suspendResult } = await a.query(
-    "select suspended from otra.suspend($1, 'w1', array['child-key'])",
-    [parent],
+    "select suspended from otra.suspend_local($1, $2, $3, 'w1', array['child-key'])",
+    [parent.queueId, parent.rootId, parent.executionId],
   );
   assert.equal(suspendResult[0].suspended, true);
 
   // B completes the child; its wake of the parent must block on A's lock.
-  const completing = b.query("select otra.complete($1, 'w2', '\"r\"'::jsonb)", [
-    child,
-  ]);
+  const completing = b.query(
+    "select otra.complete_local($1, $2, $3, 'w2', '\"r\"'::jsonb)",
+    [child.queueId, child.rootId, child.executionId],
+  );
   await waitUntilBlockedOnLock(bPid);
 
   await a.query("commit");
@@ -94,8 +111,10 @@ test("suspend-then-resolve: a child completing against a parking parent still wa
   const snapshot = (await env.app.getExecution(parent))!;
   assert.equal(snapshot.status, "pending");
   const { rows: promise } = await env.pool.query(
-    "select status, value from otra.promises where execution_id = $1 and key = 'child-key'",
-    [parent],
+    `select status, value
+       from otra.p_${parent.queueId.replaceAll("-", "")}
+      where root_id = $1 and execution_id = $2 and key = 'child-key'`,
+    [parent.rootId, parent.executionId],
   );
   assert.equal(promise[0].status, "resolved");
 });
@@ -106,12 +125,15 @@ test("resolve-then-suspend: a parent parking against a completed child refuses t
   // A completes the child and holds the transaction open: the child promise
   // is settled (invisibly) and the parent's row lock is held by _wake.
   await a.query("begin");
-  await a.query("select otra.complete($1, 'w2', '\"r\"'::jsonb)", [child]);
+  await a.query(
+    "select otra.complete_local($1, $2, $3, 'w2', '\"r\"'::jsonb)",
+    [child.queueId, child.rootId, child.executionId],
+  );
 
   // B (the parent's worker) tries to park; it must block on the parent row.
   const parking = b.query(
-    "select suspended from otra.suspend($1, 'w1', array['child-key'])",
-    [parent],
+    "select suspended from otra.suspend_local($1, $2, $3, 'w1', array['child-key'])",
+    [parent.queueId, parent.rootId, parent.executionId],
   );
   await waitUntilBlockedOnLock(bPid);
 

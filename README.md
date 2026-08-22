@@ -145,7 +145,7 @@ through:
   `DurableHandle`. Replay-safe: the child promise is the memo, so replays
   never double-spawn.
 - `ctx.promise(label?, { timeout? })` — create an externally-settleable
-  promise: a normal handle plus an opaque token (`otr_...`) to hand to the
+  promise: a normal handle plus an opaque token (`otr1_...`) to hand to the
   outside world (an approval link, a webhook correlation id). Regular code
   settles exactly that promise with `app.resolvePromise(token, value)` /
   `app.rejectPromise(token, error)` — write-once, waking the suspended
@@ -166,8 +166,8 @@ through:
 
 `app.task(nameOrOpts, handler)`, `app.spawn(task, params, opts?)`,
 `app.emitEvent(name, payload?)`, `app.resolvePromise(token, value)` /
-`app.rejectPromise(token, error)`, `app.getResult(id)`,
-`app.getExecution(id)`, `app.cancel(id)`, `app.kill(id)`,
+`app.rejectPromise(token, error)`, `app.getResult(execution)`,
+`app.getExecution(execution)`, `app.cancel(execution)`, `app.kill(execution)`,
 `app.createQueue(name?)`, `app.getQueue(name?)`, `app.listQueues()`,
 `app.setQueuePolicy(name, policy)`, `app.getQueuePolicy(name?)`,
 `app.ensurePartitions(name?)`, `app.listDetachCandidates(name?)`,
@@ -176,7 +176,9 @@ through:
 Top-level spawns accept an `idempotencyKey` (at-most-one execution per
 `(queue, key)`, race-safe), protecting the API boundary against double
 delivery -- child spawns are already deduplicated by the parent's promise
-key. Workers run up to `concurrency` executions concurrently with slot-based
+key. A spawn returns an `ExecutionRef` containing the stable queue ID, root ID,
+and execution ID required for direct queue and partition routing. Workers run
+up to `concurrency` executions concurrently with slot-based
 claiming: one slow step never blocks the worker from picking up other work,
 and `stop()` drains in-flight executions gracefully.
 
@@ -185,7 +187,7 @@ and `stop()` drains in-flight executions gracefully.
 Two verbs, following every production engine surveyed in
 [docs/cancellation-design.md](docs/cancellation-design.md):
 
-- `app.cancel(id, { cascade, reason })` — **graceful**. Cancellation is a
+- `app.cancel(execution, { cascade, reason })` — **graceful**. Cancellation is a
   *request* against a live execution (a `cancel_requested_at` column; status
   stays `running`), discovered through the claim or the heartbeat and
   delivered as a catchable `CancelledError` thrown into the generator at the
@@ -204,7 +206,7 @@ Two verbs, following every production engine surveyed in
   default; children spawned with `onParentCancel: 'detach'` are exempt.
   Test with `isCancellation(err)` — also true for an awaited child that was
   cancelled.
-- `app.kill(id, { cascade, reason })` — **immediate**, no compensation. The
+- `app.kill(execution, { cascade, reason })` — **immediate**, no compensation. The
   driving worker discovers sqlstate `OT002` at its next history write and
   abandons (reported as `killed`, distinct from a stolen claim's `OT001`).
 
@@ -223,15 +225,17 @@ inject memoized results at each `yield`, execute the first unrecorded `run`
 loss during a long step), and park the execution when it blocks on an
 unresolved remote promise.
 
-Three tables: `otra.executions` (the tree), `otra.promises` (the
-histories), `otra.events` (the cache). States:
+Each provisioned queue owns an `x_<queue-id>` execution tree, a
+`p_<queue-id>` promise journal, and an `e_<queue-id>` event-fact table.
+Partitioned queues range-partition executions and promises together by
+`root_id`. States:
 `pending → running → suspended/completed/failed/cancelled`. Retries are
 attempt-scoped like absurd: the *task* retries, checkpointed steps don't
 re-run.
 
 Two details worth stealing even if you throw the rest away:
 
-- `otra.suspend()` locks the execution row *before* checking whether any
+- The suspension transition locks the execution row *before* checking whether any
   blocker already settled, while resolvers lock promise-then-execution; the
   race between "I'm going to sleep" and "your child just finished" therefore
   always converges (refuse-to-suspend → immediate replay, or wake-after-park).

@@ -22,16 +22,16 @@ test("await-then-emit: task suspends until the event arrives", async () => {
     return `shipped via ${packed.tracking}`;
   });
 
-  const { executionId } = await app.spawn(task, { orderId: "42" });
+  const execution = await app.spawn(task, { orderId: "42" });
   const worker = app.createWorker({ workerId: "w1" });
 
   await worker.tick();
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
   assert.equal(await worker.tick(), 0);
 
   await app.emitEvent("packed:42", { tracking: "TRACK-9" });
   assert.equal(await worker.tick(), 1);
-  assert.equal(await app.getResult(executionId), "shipped via TRACK-9");
+  assert.equal(await app.getResult(execution), "shipped via TRACK-9");
 });
 
 test("emit-then-await: cached events resolve without suspending", async () => {
@@ -43,10 +43,10 @@ test("emit-then-await: cached events resolve without suspending", async () => {
   });
 
   await app.emitEvent("already-there", { n: 7 });
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   assert.equal(await worker.tick(), 1);
-  assert.equal(await app.getResult(executionId), 7);
+  assert.equal(await app.getResult(execution), 7);
 });
 
 test("event timeout is thrown into the task and is catchable", async () => {
@@ -62,14 +62,14 @@ test("event timeout is thrown into the task and is catchable", async () => {
     }
   });
 
-  const { executionId } = await app.spawn(catching, null);
+  const execution = await app.spawn(catching, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
 
   await env.advance(3601);
   await worker.tick();
-  assert.equal(await app.getResult(executionId), "gave-up");
+  assert.equal(await app.getResult(execution), "gave-up");
 });
 
 test("uncaught event timeout fails the execution without retries", async () => {
@@ -80,13 +80,13 @@ test("uncaught event timeout fails the execution without retries", async () => {
     return "arrived";
   });
 
-  const { executionId } = await app.spawn(task, null, { maxAttempts: 5 });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
   await env.advance(3601);
   await worker.tick();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "failed");
   assert.equal(snapshot.attempt, 1); // memoized rejection: retrying is futile
   assert.equal(snapshot.error?.name, "EventTimeoutError");
@@ -108,16 +108,18 @@ test("an event name is an immutable fact: repeat waits agree, repeat emits are n
   await app.emitEvent("launched", { n: 1 });
   await app.emitEvent("launched", { n: 99 }); // no-op: first write won
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
 
   // Both waits resolve immediately with the same immutable fact.
-  assert.deepEqual(await app.getResult(executionId), [1, 1]);
+  assert.deepEqual(await app.getResult(execution), [1, 1]);
 
   // Exactly one event row exists for the name.
   const { rows } = await pool.query(
-    "select count(*)::int as n, min(payload ->> 'n') as v from otra.events where name = 'launched'",
+    `select count(*)::int as n, min(payload ->> 'n') as v
+       from otra.e_${execution.queueId.replaceAll("-", "")}
+      where name = 'launched'`,
   );
   assert.equal(rows[0].n, 1);
   assert.equal(rows[0].v, "1");
@@ -134,12 +136,12 @@ test("a no-op re-emit does not disturb waiters already resolved by the fact", as
   const early = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  assert.equal(await app.getResult(early.executionId), "first");
+  assert.equal(await app.getResult(early), "first");
 
   await app.emitEvent("sealed", { v: "second" }); // no-op
   const late = await app.spawn(task, null);
   await worker.tick();
-  assert.equal(await app.getResult(late.executionId), "first");
+  assert.equal(await app.getResult(late), "first");
 });
 
 test("one event wakes every waiter on the queue", async () => {
@@ -161,6 +163,6 @@ test("one event wakes every waiter on the queue", async () => {
   await app.emitEvent("broadcast", { v: "x" });
   await worker.drain();
 
-  assert.equal(await app.getResult(a.executionId), "1:x");
-  assert.equal(await app.getResult(b.executionId), "2:x");
+  assert.equal(await app.getResult(a), "1:x");
+  assert.equal(await app.getResult(b), "2:x");
 });

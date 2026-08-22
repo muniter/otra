@@ -18,11 +18,11 @@ test("completes a simple task and returns its result", async () => {
     return { greeting };
   });
 
-  const { executionId } = await app.spawn(hello, { name: "Lily" });
+  const execution = await app.spawn(hello, { name: "Lily" });
   const worker = app.createWorker({ workerId: "w1" });
   assert.equal(await worker.tick(), 1);
 
-  const result = await app.getResult<{ greeting: string }>(executionId);
+  const result = await app.getResult<{ greeting: string }>(execution);
   assert.deepEqual(result, { greeting: "Hello, Lily!" });
 });
 
@@ -44,11 +44,11 @@ test("steps are memoized across suspension and never re-execute", async () => {
     return b;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
 
   await worker.tick();
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
   assert.deepEqual(calls, { a: 1, b: 0, outside: 1 });
 
   // Not due yet: nothing to claim.
@@ -56,7 +56,7 @@ test("steps are memoized across suspension and never re-execute", async () => {
 
   await env.advance(61);
   assert.equal(await worker.tick(), 1);
-  assert.equal(await app.getResult(executionId), "a-result+b");
+  assert.equal(await app.getResult(execution), "a-result+b");
   // The generator replayed from the top (outside code ran twice) but the
   // checkpointed step did not re-execute.
   assert.deepEqual(calls, { a: 1, b: 1, outside: 2 });
@@ -75,13 +75,13 @@ test("deterministic helpers are stable across replay", async () => {
     return { id, rand };
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
   await env.advance(11);
   await worker.tick();
 
-  const result = await app.getResult<{ id: string; rand: number }>(executionId);
+  const result = await app.getResult<{ id: string; rand: number }>(execution);
   // Replay after the sleep injected the same memoized values.
   assert.deepEqual(seen.first, [
     result.id,
@@ -105,10 +105,10 @@ test("replay divergence is detected and fails permanently", async () => {
     return "done";
   });
 
-  const { executionId } = await app.spawn(task, null, { maxAttempts: 5 });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
 
   // Simulate a bad code change while the execution slept: the promise at
   // key "point" is recorded as a run, but the code now produces an event
@@ -117,7 +117,7 @@ test("replay divergence is detected and fails permanently", async () => {
   await env.advance(11);
   await worker.tick();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "failed");
   assert.equal(snapshot.error?.name, "DeterminismViolationError");
   // Non-retryable: it failed on the first divergent attempt.

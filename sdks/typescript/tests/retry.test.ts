@@ -29,25 +29,25 @@ test("a failing step retries the task with backoff; finished steps are skipped",
     return `${stable}/${flaky}`;
   });
 
-  const { executionId } = await app.spawn(task, null, {
+  const execution = await app.spawn(task, null, {
     retryStrategy: { kind: "exponential", base_s: 1, factor: 2, max_s: 300 },
   });
   const worker = app.createWorker({ workerId: "w1" });
 
   await worker.tick(); // attempt 1 fails
-  let snapshot = (await app.getExecution(executionId))!;
+  let snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "pending");
   assert.equal(snapshot.attempt, 1);
   assert.equal(await worker.tick(), 0); // backoff not elapsed
 
   await env.advance(2); // past 1s backoff
   await worker.tick(); // attempt 2 fails
-  snapshot = (await app.getExecution(executionId))!;
+  snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.attempt, 2);
 
   await env.advance(3); // past 2s backoff
   await worker.tick(); // attempt 3 succeeds
-  assert.equal(await app.getResult(executionId), "stable-value/finally");
+  assert.equal(await app.getResult(execution), "stable-value/finally");
   // The stable step ran exactly once; only the flaky step re-executed.
   assert.deepEqual(calls, { stable: 1, flaky: 3 });
 });
@@ -63,7 +63,7 @@ test("attempts are bounded by maxAttempts", async () => {
     });
   });
 
-  const { executionId } = await app.spawn(task, null, {
+  const execution = await app.spawn(task, null, {
     maxAttempts: 3,
     retryStrategy: { kind: "fixed", base_s: 1 },
   });
@@ -74,7 +74,7 @@ test("attempts are bounded by maxAttempts", async () => {
     await env.advance(2);
   }
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "failed");
   assert.equal(snapshot.attempt, 3);
   assert.equal(calls, 3);
@@ -92,13 +92,13 @@ test("TaskError(retryable=false) fails immediately", async () => {
     });
   });
 
-  const { executionId } = await app.spawn(task, null, { maxAttempts: 5 });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
   await env.advance(600);
   await worker.drain();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "failed");
   assert.equal(calls, 1);
 });
@@ -119,14 +119,17 @@ test("a crashed worker's claim expires and another worker resumes the task", asy
     return `${a}/${b}`;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
 
   // Worker A claims the execution, writes the first checkpoint, then "dies"
   // (we simulate the crash by doing both directly, without ever finishing).
-  await pool.query("select * from otra.claim('default', 'worker-a', 30, 1)");
+  await pool.query("select * from otra.claim_local('default', 'worker-a', 30, 1)");
   await pool.query(
-    "select otra.record_run($1, 'worker-a', 'before-crash', 'before-crash', '\"checkpointed\"'::jsonb, 30)",
-    [executionId],
+    `select otra.record_run_local(
+       $1, $2, $3, 'worker-a', 'before-crash', 'before-crash',
+       '\"checkpointed\"'::jsonb, 30
+     )`,
+    [execution.queueId, execution.rootId, execution.executionId],
   );
 
   const workerB = app.createWorker({ workerId: "worker-b" });
@@ -137,8 +140,8 @@ test("a crashed worker's claim expires and another worker resumes the task", asy
   await env.advance(2); // past the retry backoff
   await workerB.tick();
 
-  assert.equal(await app.getResult(executionId), "checkpointed/recovered");
-  const snapshot = (await app.getExecution(executionId))!;
+  assert.equal(await app.getResult(execution), "checkpointed/recovered");
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.attempt, 1); // the crash consumed one attempt
   // Worker B replayed from the top but reused worker A's checkpoint.
   assert.deepEqual(calls, { before: 0, after: 1 });

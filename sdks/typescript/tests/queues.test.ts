@@ -3,6 +3,7 @@ import { afterEach, beforeEach, test } from "node:test";
 
 import pg from "pg";
 
+import { Otra } from "../src/index.ts";
 import { createTestEnv, waitFor, type TestEnv } from "./helpers.ts";
 
 let env: TestEnv;
@@ -145,6 +146,65 @@ test("provisions a partitioned queue with its current storage window", async () 
     min_children: 6,
     max_children: 6,
   });
+});
+
+test("runs an effect-free execution from queue-local storage", async () => {
+  const { app, pool } = env;
+
+  await assert.rejects(
+    app.spawn("missing-queue-task", null),
+    /Queue "orders" does not exist/,
+  );
+
+  for (const storageMode of ["unpartitioned", "partitioned"] as const) {
+    const queue = `runtime-${storageMode}`;
+    await app.createQueue(queue, { storageMode });
+    const local = new Otra({ db: pool, queue });
+    const task = local.task(`hello-${storageMode}`, function* () {
+      return { storageMode };
+    });
+
+    const executions = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        local.spawn(task, null, { idempotencyKey: "delivery-1" }),
+      ),
+    );
+    const [execution, ...duplicates] = executions as [
+      (typeof executions)[number],
+      ...(typeof executions)[number][],
+    ];
+    assert.match(execution.queueId, /^[0-9a-f-]{36}$/);
+    assert.equal(execution.rootId, execution.executionId);
+    assert.equal(
+      duplicates.every(
+        (duplicate) =>
+          duplicate.queueId === execution.queueId &&
+          duplicate.rootId === execution.rootId &&
+          duplicate.executionId === execution.executionId,
+      ),
+      true,
+    );
+
+    assert.equal(await local.createWorker().tick(), 1);
+    assert.deepEqual(await local.getResult(execution), { storageMode });
+    assert.equal((await local.getExecution(execution))!.status, "completed");
+
+    const stored = await pool.query(
+      `select
+         to_regclass('otra.executions') as shared,
+         format('otra.%I', 'x_' || replace($1::text, '-', ''))::regclass as local_table`,
+      [execution.queueId],
+    );
+    assert.equal(stored.rows[0].shared, null);
+    const localRows = await pool.query(
+      `select count(*)::int as count from ${stored.rows[0].local_table}
+        where root_id = $1 and id = $2`,
+      [execution.rootId, execution.executionId],
+    );
+    assert.equal(localRows.rows[0].count, 1);
+
+    await local.close();
+  }
 });
 
 test("extends a partitioned queue's storage window", async () => {

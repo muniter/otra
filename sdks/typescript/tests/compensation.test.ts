@@ -48,20 +48,22 @@ test("compensation can call a durable child task and await it", async () => {
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick(); // parked on the 30d sleep
-  await app.cancel(executionId, { cascade: false });
+  await app.cancel(execution, { cascade: false });
   await worker.drain(); // deliver -> spawn refund -> park -> refund runs -> resume
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled");
   assert.equal(refunds, 1);
 
   // The delivery point is journal, and the compensation is checkpointed.
+  const storage = execution.queueId.replaceAll("-", "");
   const { rows } = await pool.query(
-    "select key, kind, status from otra.promises where execution_id = $1 order by key",
-    [executionId],
+    `select key, kind, status from otra.p_${storage}
+      where root_id = $1 and execution_id = $2 order by key`,
+    [execution.rootId, execution.executionId],
   );
   const byKey = new Map(
     rows.map((r: { key: string; kind: string }) => [r.key, r.kind]),
@@ -69,7 +71,7 @@ test("compensation can call a durable child task and await it", async () => {
   assert.equal(byKey.get("$cancel"), "cancel");
   assert.ok(byKey.has("log-receipt"));
   const { rows: child } = await pool.query(
-    "select status from otra.executions where function_name = 'refund'",
+    `select status from otra.x_${storage} where function_name = 'refund'`,
   );
   assert.equal(child[0].status, "completed");
 });
@@ -92,18 +94,18 @@ test("compensation can sleep", async () => {
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  await app.cancel(executionId);
+  await app.cancel(execution);
   await worker.tick(); // delivers; runs first-half; parks on the 5m sleep
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
   assert.deepEqual(order, ["first"]);
 
   await env.advance(301);
   await worker.tick(); // replay re-delivers at the same yield, resumes cleanup
 
-  assert.equal((await app.getExecution(executionId))!.status, "cancelled");
+  assert.equal((await app.getExecution(execution))!.status, "cancelled");
   assert.deepEqual(order, ["first", "second"]);
 });
 
@@ -130,10 +132,10 @@ test("the delivery point holds even if the forward promise settles later", async
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick(); // parked awaiting the external promise
-  await app.cancel(executionId);
+  await app.cancel(execution);
   await worker.tick(); // delivered AT the await; parked on the 1m sleep
 
   // The forward promise resolves while compensation is parked. Without the
@@ -143,7 +145,7 @@ test("the delivery point holds even if the forward promise settles later", async
   await env.advance(61);
   await worker.tick();
 
-  assert.equal((await app.getExecution(executionId))!.status, "cancelled");
+  assert.equal((await app.getExecution(execution))!.status, "cancelled");
   assert.equal(forwardResumed, false);
 });
 
@@ -169,17 +171,17 @@ test("a failing compensation step retries and resumes compensation", async () =>
     }
   });
 
-  const { executionId } = await app.spawn(task, null, { maxAttempts: 5 });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  await app.cancel(executionId);
+  await app.cancel(execution);
   await worker.tick(); // delivers; cleanup-a records; cleanup-flaky fails -> retry
-  assert.equal((await app.getExecution(executionId))!.status, "pending");
+  assert.equal((await app.getExecution(execution))!.status, "pending");
 
   await env.advance(2); // past the retry backoff
   await worker.tick(); // replay re-delivers; cleanup-a memoized; flaky succeeds
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled");
   assert.equal(snapshot.attempt, 1); // one recorded failed attempt
   assert.deepEqual(calls, { done: 1, flaky: 2 }); // -a never re-executed
@@ -204,19 +206,19 @@ test("compensation exhausting its attempts still finalizes as cancelled, never f
     }
   });
 
-  const { executionId } = await app.spawn(task, null, {
+  const execution = await app.spawn(task, null, {
     maxAttempts: 3,
     retryStrategy: { kind: "fixed", base_s: 1 },
   });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  await app.cancel(executionId);
+  await app.cancel(execution);
   for (let i = 0; i < 5; i++) {
     await worker.tick();
     await env.advance(2);
   }
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled"); // the outcome cancel owns
   assert.equal(snapshot.error?.message, "cleanup broken");
   assert.ok(tries >= 2);

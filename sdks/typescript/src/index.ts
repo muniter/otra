@@ -38,10 +38,12 @@ export {
   serializeError,
 } from "./types.ts";
 export type {
+  ChildSpawnOptions,
   DurableHandle,
   Effect,
   ExternalPromise,
   ErrorPayload,
+  ExecutionRef,
   ExecutionSnapshot,
   ExecutionStatus,
   JsonValue,

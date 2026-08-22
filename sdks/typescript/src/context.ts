@@ -1,11 +1,11 @@
 import {
   CancelledError,
+  type ChildSpawnOptions,
   type DurableHandle,
   type Effect,
   type ExternalPromise,
   type JsonValue,
   type Op,
-  type SpawnOptions,
   type TaskHandle,
 } from "./types.ts";
 
@@ -158,7 +158,7 @@ export class Ctx {
   spawn<P, R>(
     task: TaskHandle<P, R> | string,
     params: P,
-    options: SpawnOptions & { label?: string } = {},
+    options: ChildSpawnOptions & { label?: string } = {},
   ): Op<DurableHandle<R>> {
     const taskName = typeof task === "string" ? task : task.name;
     const { label, ...spawnOptions } = options;
@@ -174,7 +174,7 @@ export class Ctx {
   /**
    * Create an externally-settleable durable promise.  Returns a normal
    * handle (redeem with `ctx.await` / `ctx.all`) plus an opaque token
-   * (`otr_...`) to hand to the outside world; regular code settles exactly
+   * (`otr1_...`) to hand to the outside world; regular code settles exactly
    * this promise with `app.resolvePromise(token, value)` or
    * `app.rejectPromise(token, error)`.  With a timeout, the await throws a
    * catchable `TimeoutError` instead of waiting forever.
@@ -211,7 +211,7 @@ export class Ctx {
   *call<P, R>(
     task: TaskHandle<P, R> | string,
     params: P,
-    options: SpawnOptions & { label?: string } = {},
+    options: ChildSpawnOptions & { label?: string } = {},
   ): Op<R> {
     const handle = yield* this.spawn(task, params, options);
     return yield* this.await(handle);

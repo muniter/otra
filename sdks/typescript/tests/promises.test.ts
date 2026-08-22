@@ -31,17 +31,17 @@ test("human-in-the-loop: outside code resolves a promise by token", async () => 
     return `approved by ${decision.approvedBy}`;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
 
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
-  assert.ok(handedOut!.startsWith("otr_"), `token looks opaque: ${handedOut}`);
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
+  assert.ok(handedOut!.startsWith("otr1_"), `token looks opaque: ${handedOut}`);
 
   const settled = await app.resolvePromise(handedOut!, { approvedBy: "hazel" });
   assert.equal(settled, true);
   await worker.tick();
-  assert.equal(await app.getResult(executionId), "approved by hazel");
+  assert.equal(await app.getResult(execution), "approved by hazel");
 });
 
 test("external promises are write-once", async () => {
@@ -56,7 +56,7 @@ test("external promises are write-once", async () => {
     return (yield* ctx.await(p)).n;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
 
@@ -66,7 +66,7 @@ test("external promises are write-once", async () => {
   assert.equal(await app.rejectPromise(token!, "too late"), false);
 
   await worker.tick();
-  assert.equal(await app.getResult(executionId), 1);
+  assert.equal(await app.getResult(execution), 1);
 });
 
 test("rejecting an external promise throws at the await, catchably", async () => {
@@ -86,13 +86,13 @@ test("rejecting an external promise throws at the await, catchably", async () =>
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
 
   assert.equal(await app.rejectPromise(token!, "budget exceeded"), true);
   await worker.tick();
-  assert.equal(await app.getResult(executionId), "denied: budget exceeded");
+  assert.equal(await app.getResult(execution), "denied: budget exceeded");
 });
 
 test("external promises can time out, rejecting with TimeoutError", async () => {
@@ -109,14 +109,14 @@ test("external promises can time out, rejecting with TimeoutError", async () => 
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
 
   await env.advance(3601);
   await worker.tick();
-  assert.equal(await app.getResult(executionId), "gave-up");
+  assert.equal(await app.getResult(execution), "gave-up");
 });
 
 test("resolve-then-await: a promise settled while the task was elsewhere injects without suspending", async () => {
@@ -133,14 +133,14 @@ test("resolve-then-await: a promise settled while the task was elsewhere injects
     return value.v;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick(); // parked on the sleep
 
   assert.equal(await app.resolvePromise(token!, { v: "early" }), true);
   await env.advance(11);
   await worker.tick(); // timer due; replay finds the promise already resolved
-  assert.equal(await app.getResult(executionId), "early");
+  assert.equal(await app.getResult(execution), "early");
 });
 
 test("tokens are replay-stable and ctx.all mixes external and child handles", async () => {
@@ -163,15 +163,15 @@ test("tokens are replay-stable and ctx.all mixes external and child handles", as
     return `${fromOutside}+${fromChild}`;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain(); // child completes; parent still blocked on external
 
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
   await app.resolvePromise(token!, "from-outside");
   await worker.drain();
 
-  assert.equal(await app.getResult(executionId), "from-outside+from-child");
+  assert.equal(await app.getResult(execution), "from-outside+from-child");
   // The body replayed at least twice; the token never changed.
   assert.ok(seenTokens.length >= 2);
   assert.equal(new Set(seenTokens).size, 1);
@@ -191,13 +191,13 @@ test("cancelling an execution parked on an external promise unwinds it", async (
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  await app.cancel(executionId);
+  await app.cancel(execution);
   await worker.tick();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled"); // engine-owned outcome
 });
 
@@ -209,16 +209,20 @@ test("only external promises can be settled from outside", async () => {
     return "done";
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
 
   // Grab the internal run checkpoint's row id and try to settle it.
   const { rows } = await pool.query(
-    "select id from otra.promises where execution_id = $1 and key = 'step'",
-    [executionId],
+    `select id from otra.p_${execution.queueId.replaceAll("-", "")}
+      where root_id = $1 and execution_id = $2 and key = 'step'`,
+    [execution.rootId, execution.executionId],
   );
-  assert.equal(await app.resolvePromise(`otr_${rows[0].id}`, "hijack"), false);
+  const token = `otr1_${Buffer.from(
+    `${execution.queueId}:${execution.rootId}:${rows[0].id}`,
+  ).toString("base64url")}`;
+  assert.equal(await app.resolvePromise(token, "hijack"), false);
 
   // And a malformed token is rejected loudly, not treated as a miss.
   await assert.rejects(

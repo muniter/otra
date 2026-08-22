@@ -16,6 +16,7 @@ import {
 import { Worker, type WorkerOptions } from "./worker.ts";
 import {
   ExecutionFailedError,
+  type ExecutionRef,
   type ExecutionSnapshot,
   type RegisteredTask,
   type SpawnOptions,
@@ -90,7 +91,6 @@ export class Otra {
     }
     this.registry.set(options.name, {
       name: options.name,
-      queue: options.queue,
       maxAttempts: options.maxAttempts,
       retryStrategy: options.retryStrategy,
       handler: handler as RegisteredTask["handler"],
@@ -139,26 +139,31 @@ export class Otra {
     return this.db.listDetachCandidates(name);
   }
 
-  /** Spawn a top-level execution; returns its id immediately. */
+  /** Spawn a top-level execution; returns its queue-local address immediately. */
   async spawn<P, R>(
     task: TaskHandle<P, R> | string,
     params: P,
     options: SpawnOptions = {},
-  ): Promise<{ executionId: string }> {
+  ): Promise<ExecutionRef> {
     const name = typeof task === "string" ? task : task.name;
     const registered = this.registry.get(name);
     const spawned = await this.db.spawn(
       name,
       params,
-      options.queue ?? registered?.queue ?? this.queue,
+      options.queue ?? this.queue,
       {
         maxAttempts: options.maxAttempts ?? registered?.maxAttempts,
         retryStrategy: options.retryStrategy ?? registered?.retryStrategy,
         delaySeconds: options.delaySeconds,
         idempotencyKey: options.idempotencyKey,
+        onParentCancel: options.onParentCancel,
       },
     );
-    return { executionId: spawned.executionId };
+    return {
+      queueId: spawned.queueId,
+      rootId: spawned.rootId,
+      executionId: spawned.executionId,
+    };
   }
 
   /**
@@ -188,8 +193,8 @@ export class Otra {
     await this.db.emitEvent(queue ?? this.queue, name, payload ?? null);
   }
 
-  async getExecution(executionId: string): Promise<ExecutionSnapshot | null> {
-    return this.db.getExecution(executionId);
+  async getExecution(execution: ExecutionRef): Promise<ExecutionSnapshot | null> {
+    return this.db.getExecution(execution);
   }
 
   /**
@@ -197,14 +202,15 @@ export class Otra {
    * Throws `ExecutionFailedError` on failure or cancellation.
    */
   async getResult<R = unknown>(
-    executionId: string,
+    execution: ExecutionRef,
     options: GetResultOptions = {},
   ): Promise<R> {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const pollMs = options.pollMs ?? 25;
     const deadline = Date.now() + timeoutMs;
     while (true) {
-      const snapshot = await this.db.getExecution(executionId);
+      const snapshot = await this.db.getExecution(execution);
+      const executionId = execution.executionId;
       if (snapshot === null) {
         throw new ExecutionFailedError(executionId, "failed", {
           message: "execution not found",
@@ -234,11 +240,11 @@ export class Otra {
    * (running or mid-retry; the worker delivers it).
    */
   async cancel(
-    executionId: string,
+    execution: ExecutionRef,
     options: { cascade?: boolean; reason?: string } = {},
   ): Promise<Array<{ executionId: string; action: string }>> {
     return this.db.requestCancel(
-      executionId,
+      execution,
       options.cascade ?? true,
       options.reason ?? null,
     );
@@ -251,11 +257,11 @@ export class Otra {
    * executions were terminated.
    */
   async kill(
-    executionId: string,
+    execution: ExecutionRef,
     options: { cascade?: boolean; reason?: string } = {},
   ): Promise<number> {
     return this.db.kill(
-      executionId,
+      execution,
       options.cascade ?? true,
       options.reason ?? null,
     );

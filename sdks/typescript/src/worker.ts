@@ -87,7 +87,7 @@ export class Worker {
     const registered = this.registry.get(execution.functionName);
     if (registered === undefined) {
       // Likely a rolling deploy: another worker knows this function.
-      await this.db.defer(execution.executionId, this.workerId, 15);
+      await this.db.defer(execution, this.workerId, 15);
       return undefined;
     }
     try {
@@ -118,7 +118,7 @@ export class Worker {
       this.onError(err);
       try {
         await this.db.failAttempt(
-          execution.executionId,
+          execution,
           this.workerId,
           serializeError(err),
           true,

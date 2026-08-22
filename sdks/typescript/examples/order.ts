@@ -74,7 +74,7 @@ const orderFulfillment = app.task(
   },
 );
 
-const { executionId } = await app.spawn(orderFulfillment, {
+const execution = await app.spawn(orderFulfillment, {
   orderId: "42",
   amount: 9_999,
   items: ["widget-1", "gadget-2"],
@@ -88,5 +88,5 @@ setTimeout(() => {
   void app.emitEvent(`shipment.packed:42`, { trackingNumber: "TRACK-1234" });
 }, 500);
 
-console.log("order result:", await app.getResult(executionId));
+console.log("order result:", await app.getResult(execution));
 process.exit(0);

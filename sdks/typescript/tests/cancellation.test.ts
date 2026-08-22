@@ -27,11 +27,11 @@ test("cancelling a pending execution with no history finalizes immediately", asy
   app.task("never-runs", function* (_params: null, ctx) {
     return yield* ctx.run("nope", () => "unreachable");
   });
-  const { executionId } = await app.spawn("never-runs", null);
+  const execution = await app.spawn("never-runs", null);
 
-  await app.cancel(executionId, { reason: "changed my mind" });
+  await app.cancel(execution, { reason: "changed my mind" });
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled");
   assert.equal(snapshot.cancelReason, "changed my mind");
   // No worker ever claimed it.
@@ -61,25 +61,28 @@ test("cancelling a suspended execution wakes it and delivers at the blocked yiel
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  assert.equal((await app.getExecution(executionId))!.status, "suspended");
+  assert.equal((await app.getExecution(execution))!.status, "suspended");
 
-  const actions = await app.cancel(executionId);
-  assert.deepEqual(actions, [{ executionId, action: "woken" }]);
-  assert.equal((await app.getExecution(executionId))!.status, "pending");
+  const actions = await app.cancel(execution);
+  assert.deepEqual(actions, [
+    { executionId: execution.executionId, action: "woken" },
+  ]);
+  assert.equal((await app.getExecution(execution))!.status, "pending");
 
   await worker.tick();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled");
   // Forward work was memoized on the replay, not re-executed; compensation
   // ran exactly once and was recorded as a promise.
   assert.deepEqual(calls, { forward: 1, compensate: 1 });
   const { rows } = await pool.query(
-    "select status from otra.promises where execution_id = $1 and key = 'compensate'",
-    [executionId],
+    `select status from otra.p_${execution.queueId.replaceAll("-", "")}
+      where root_id = $1 and execution_id = $2 and key = 'compensate'`,
+    [execution.rootId, execution.executionId],
   );
   assert.equal(rows[0].status, "resolved");
 });
@@ -95,13 +98,13 @@ test("catching CancelledError and returning normally still ends 'cancelled'", as
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  await app.cancel(executionId);
+  await app.cancel(execution);
   await worker.tick();
 
-  assert.equal((await app.getExecution(executionId))!.status, "cancelled");
+  assert.equal((await app.getExecution(execution))!.status, "cancelled");
 });
 
 test("an error thrown during compensation is recorded but never retried", async () => {
@@ -116,15 +119,15 @@ test("an error thrown during compensation is recorded but never retried", async 
     }
   });
 
-  const { executionId } = await app.spawn(task, null, { maxAttempts: 5 });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick();
-  await app.cancel(executionId);
+  await app.cancel(execution);
   await worker.tick();
   await env.advance(600);
   await worker.drain();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled"); // never 'failed'
   assert.equal(snapshot.error?.message, "cleanup exploded");
   assert.equal(snapshot.attempt, 0); // no retries were consumed
@@ -161,7 +164,7 @@ test("a running execution discovers cancellation through the heartbeat", async (
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   // claimSeconds 1 => heartbeat every ~500ms carries the flag back.
   const worker = app.createWorker({
     workerId: "w1",
@@ -172,7 +175,7 @@ test("a running execution discovers cancellation through the heartbeat", async (
   worker.start();
   try {
     await arrived;
-    await app.cancel(executionId, { reason: "operator" });
+    await app.cancel(execution, { reason: "operator" });
 
     // The worker notices without finishing the step: flag + AbortSignal.
     await waitFor(() => seenCtx?.cancelRequested === true, {
@@ -182,15 +185,16 @@ test("a running execution discovers cancellation through the heartbeat", async (
 
     gate.emit("release");
     await waitFor(
-      async () => (await app.getExecution(executionId))!.status === "cancelled",
+      async () => (await app.getExecution(execution))!.status === "cancelled",
       { label: "execution finalized" },
     );
 
     // The in-flight step finished and was recorded (nobody preempts a local
     // step by default); the next forward step never ran; compensation did.
     const { rows } = await pool.query(
-      "select key, status from otra.promises where execution_id = $1 order by key",
-      [executionId],
+      `select key, status from otra.p_${execution.queueId.replaceAll("-", "")}
+        where root_id = $1 and execution_id = $2 order by key`,
+      [execution.rootId, execution.executionId],
     );
     const keys = rows.map((r: { key: string }) => r.key).sort();
     // $cancel is the journaled delivery point (cancellation v2).
@@ -220,7 +224,7 @@ test("kill stops a running execution without compensation (OT002, not OT001)", a
     }
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({
     workerId: "w1",
     claimSeconds: 30,
@@ -230,8 +234,8 @@ test("kill stops a running execution without compensation (OT002, not OT001)", a
   worker.start();
   try {
     await arrived;
-    await app.kill(executionId, { reason: "stuck" });
-    assert.equal((await app.getExecution(executionId))!.status, "cancelled");
+    await app.kill(execution, { reason: "stuck" });
+    assert.equal((await app.getExecution(execution))!.status, "cancelled");
 
     // Let the in-flight step finish; its checkpoint write gets OT002 and the
     // worker abandons quietly -- no compensation, no history writes.
@@ -239,7 +243,9 @@ test("kill stops a running execution without compensation (OT002, not OT001)", a
     await waitFor(
       async () => {
         const { rows } = await pool.query(
-          "select count(*)::int as n from otra.executions where status = 'running'",
+          `select count(*)::int as n
+             from otra.x_${execution.queueId.replaceAll("-", "")}
+            where status = 'running'`,
         );
         return rows[0].n === 0;
       },
@@ -247,8 +253,10 @@ test("kill stops a running execution without compensation (OT002, not OT001)", a
     );
 
     const { rows: promises } = await pool.query(
-      "select count(*)::int as n from otra.promises where execution_id = $1",
-      [executionId],
+      `select count(*)::int as n
+         from otra.p_${execution.queueId.replaceAll("-", "")}
+        where root_id = $1 and execution_id = $2`,
+      [execution.rootId, execution.executionId],
     );
     assert.equal(promises[0].n, 0);
     assert.equal(finallyRan, false);
@@ -275,23 +283,25 @@ test("cancel cascades to children by default; detached children survive", async 
     return yield* ctx.await(child);
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain(); // parent suspended on child; both children suspended
 
-  const actions = await app.cancel(executionId);
+  const actions = await app.cancel(execution);
   const byAction = new Map(actions.map((a) => [a.executionId, a.action]));
   assert.equal(byAction.size, 2); // parent + cascade child, NOT the detached one
 
   await worker.drain();
 
-  const parentSnap = (await app.getExecution(executionId))!;
+  const parentSnap = (await app.getExecution(execution))!;
   assert.equal(parentSnap.status, "cancelled");
 
   const { app: _, pool } = env;
+  const executions = `otra.x_${execution.queueId.replaceAll("-", "")}`;
   const { rows } = await pool.query(
-    "select function_name, status from otra.executions where parent_id = $1",
-    [executionId],
+    `select function_name, status from ${executions}
+      where root_id = $1 and parent_id = $2`,
+    [execution.rootId, execution.executionId],
   );
   const statuses = new Map(
     rows.map((r: { function_name: string; status: string }) => [
@@ -307,7 +317,7 @@ test("cancel cascades to children by default; detached children survive", async 
   await env.advance(6);
   await worker.drain();
   const { rows: after } = await pool.query(
-    "select status from otra.executions where function_name = 'audit'",
+    `select status from ${executions} where function_name = 'audit'`,
   );
   assert.equal(after[0].status, "completed");
 });
@@ -328,19 +338,25 @@ test("a cancelled child rejects the parent's await as a cancellation", async () 
     }
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
 
   const { pool } = env;
   const { rows } = await pool.query(
-    "select id from otra.executions where function_name = 'cancellable-child'",
+    `select id from otra.x_${execution.queueId.replaceAll("-", "")}
+      where root_id = $1 and function_name = 'cancellable-child'`,
+    [execution.rootId],
   );
-  await app.cancel(rows[0].id); // cancel the child only
+  await app.cancel({
+    queueId: execution.queueId,
+    rootId: execution.rootId,
+    executionId: rows[0].id,
+  }); // cancel the child only
   await worker.drain();
 
   // The parent itself was not cancelled; it handled the child's cancellation.
-  assert.equal(await app.getResult(executionId), "child-was-cancelled");
+  assert.equal(await app.getResult(execution), "child-was-cancelled");
 });
 
 test("ctx.uninterruptible defers delivery until the critical section exits", async () => {
@@ -365,22 +381,25 @@ test("ctx.uninterruptible defers delivery until the critical section exits", asy
     return result;
   });
 
-  const { executionId } = await app.spawn(task, null);
+  const execution = await app.spawn(task, null);
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick(); // suspends on the sleep
 
-  await app.cancel(executionId); // wakes it with the flag set
+  await app.cancel(execution); // wakes it with the flag set
   await env.advance(2); // sleep timer is due
   await worker.tick();
 
-  const snapshot = (await app.getExecution(executionId))!;
+  const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled");
   // Both critical steps ran to completion and were recorded; delivery
   // happened at the first effect after the shield.
   assert.deepEqual(calls, { a: 1, b: 1, outside: 0 });
   const { rows } = await pool.query(
-    "select count(*)::int as n from otra.promises where execution_id = $1 and key in ('critical-a', 'critical-b') and status = 'resolved'",
-    [executionId],
+    `select count(*)::int as n
+       from otra.p_${execution.queueId.replaceAll("-", "")}
+      where root_id = $1 and execution_id = $2
+        and key in ('critical-a', 'critical-b') and status = 'resolved'`,
+    [execution.rootId, execution.executionId],
   );
   assert.equal(rows[0].n, 2);
 });
@@ -409,25 +428,31 @@ test("cancel-vs-suspend race converges in both interleavings", async () => {
     // Interleaving 1: suspend lands first, cancel second -> cancel must see
     // the suspension and wake the execution.
     let { rows: s } = await pool.query(
-      "select execution_id from otra.spawn('racer', '{}'::jsonb)",
+      "select queue_id, root_id, execution_id from otra.spawn_local('racer', '{}'::jsonb, 'default')",
     );
-    const first = s[0].execution_id;
-    await pool.query("select * from otra.claim('default', 'w1', 30, 1)");
+    const first = s[0];
+    await pool.query("select * from otra.claim_local('default', 'w1', 30, 1)");
     await pool.query(
-      "select * from otra.create_sleep($1, 'w1', 's1', '$sleep', 3600)",
-      [first],
+      "select * from otra.create_sleep_local($1, $2, $3, 'w1', 's1', '$sleep', 3600)",
+      [first.queue_id, first.root_id, first.execution_id],
     );
     await a.query("begin");
-    await a.query("select * from otra.suspend($1, 'w1', array['s1'])", [first]);
-    const cancelling = b.query("select * from otra.request_cancel($1)", [
-      first,
-    ]);
+    await a.query(
+      "select * from otra.suspend_local($1, $2, $3, 'w1', array['s1'])",
+      [first.queue_id, first.root_id, first.execution_id],
+    );
+    const cancelling = b.query(
+      "select * from otra.request_cancel_local($1, $2, $3)",
+      [first.queue_id, first.root_id, first.execution_id],
+    );
     await blockedOnLock();
     await a.query("commit");
     await cancelling;
     let { rows: after } = await pool.query(
-      "select status, cancel_requested_at from otra.executions where id = $1",
-      [first],
+      `select status, cancel_requested_at
+         from otra.x_${first.queue_id.replaceAll("-", "")}
+        where root_id = $1 and id = $2`,
+      [first.root_id, first.execution_id],
     );
     assert.equal(after[0].status, "pending"); // woken, will deliver on claim
     assert.notEqual(after[0].cancel_requested_at, null);
@@ -436,20 +461,25 @@ test("cancel-vs-suspend race converges in both interleavings", async () => {
     // refuse and report the cancel so the driver delivers instead of parking.
     // A separate queue so the leftover woken execution from interleaving 1
     // cannot be the one w2 claims.
+    await env.app.createQueue("race-q2");
     ({ rows: s } = await pool.query(
-      "select execution_id from otra.spawn('racer-2', '{}'::jsonb, 'race-q2')",
+      "select queue_id, root_id, execution_id from otra.spawn_local('racer-2', '{}'::jsonb, 'race-q2')",
     ));
-    const second = s[0].execution_id;
-    await pool.query("select * from otra.claim('race-q2', 'w2', 30, 1)");
+    const second = s[0];
+    await pool.query("select * from otra.claim_local('race-q2', 'w2', 30, 1)");
     await pool.query(
-      "select * from otra.create_sleep($1, 'w2', 's1', '$sleep', 3600)",
-      [second],
+      "select * from otra.create_sleep_local($1, $2, $3, 'w2', 's1', '$sleep', 3600)",
+      [second.queue_id, second.root_id, second.execution_id],
     );
     await a.query("begin");
-    await a.query("select * from otra.request_cancel($1)", [second]);
+    await a.query("select * from otra.request_cancel_local($1, $2, $3)", [
+      second.queue_id,
+      second.root_id,
+      second.execution_id,
+    ]);
     const parking = b.query(
-      "select * from otra.suspend($1, 'w2', array['s1'])",
-      [second],
+      "select * from otra.suspend_local($1, $2, $3, 'w2', array['s1'])",
+      [second.queue_id, second.root_id, second.execution_id],
     );
     await blockedOnLock();
     await a.query("commit");
@@ -457,8 +487,9 @@ test("cancel-vs-suspend race converges in both interleavings", async () => {
     assert.equal(parked[0].suspended, false);
     assert.equal(parked[0].cancel_requested, true);
     ({ rows: after } = await pool.query(
-      "select status from otra.executions where id = $1",
-      [second],
+      `select status from otra.x_${second.queue_id.replaceAll("-", "")}
+        where root_id = $1 and id = $2`,
+      [second.root_id, second.execution_id],
     ));
     assert.equal(after[0].status, "running"); // never parked
   } finally {
@@ -491,24 +522,24 @@ test("a failed attempt with a pending cancel retries into compensation, then fin
     }
   });
 
-  const { executionId } = await app.spawn(task, null, { maxAttempts: 5 });
+  const execution = await app.spawn(task, null, { maxAttempts: 5 });
   // Flag the cancel before the first attempt even starts.
   const worker = app.createWorker({ workerId: "w1" });
-  await app.cancel(executionId); // pending, but with history? none yet...
+  await app.cancel(execution); // pending, but with history? none yet...
   // A pending execution with no history finalizes in place -- so instead,
   // run one failing attempt first, then cancel, then let the retry deliver.
   const second = await app.spawn(task, null, { maxAttempts: 5 });
   await worker.tick(); // second's attempt 1 fails (retry scheduled)
-  await app.cancel(second.executionId);
+  await app.cancel(second);
   await env.advance(2); // past the backoff
   await worker.tick(); // claim sees the flag: deliver, compensate, finalize
 
-  const snapshot = (await app.getExecution(second.executionId))!;
+  const snapshot = (await app.getExecution(second))!;
   assert.equal(snapshot.status, "cancelled");
   assert.equal(calls.compensate, 1);
   // The failing forward step was NOT re-executed on the cancel attempt:
   // delivery preempts it at the first unrecorded effect.
   assert.equal(calls.explode, 1);
   // And the first execution (cancelled with empty history) never ran at all.
-  assert.equal((await app.getExecution(executionId))!.status, "cancelled");
+  assert.equal((await app.getExecution(execution))!.status, "cancelled");
 });

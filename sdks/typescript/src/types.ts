@@ -36,24 +36,32 @@ export interface RetryStrategy {
   max_s?: number;
 }
 
-export interface SpawnOptions {
-  queue?: string;
+interface CommonSpawnOptions {
   maxAttempts?: number;
   retryStrategy?: RetryStrategy;
   /** Delay initial execution by this many seconds. */
   delaySeconds?: number;
-  /**
-   * At-most-one execution per (queue, key) for top-level spawns -- protects
-   * the API boundary against double delivery (e.g. webhook retries).
-   * Child spawns are already deduplicated by the parent's promise key.
-   */
-  idempotencyKey?: string;
   /**
    * What a parent's graceful cancel does to this child: 'cascade' (default)
    * cancels it too; 'detach' lets it run to completion (fire-and-forget
    * audit trails, notifications).
    */
   onParentCancel?: "cascade" | "detach";
+}
+
+export interface SpawnOptions extends CommonSpawnOptions {
+  queue?: string;
+  /** At-most-one top-level execution per (queue, key). */
+  idempotencyKey?: string;
+}
+
+export type ChildSpawnOptions = CommonSpawnOptions;
+
+/** Complete physical address of an execution in queue-local storage. */
+export interface ExecutionRef {
+  readonly queueId: string;
+  readonly rootId: string;
+  readonly executionId: string;
 }
 
 /**
@@ -93,7 +101,7 @@ export function isDurableHandle(value: unknown): value is DurableHandle {
 
 /**
  * A handle to an externally-settleable promise (from `ctx.promise`), plus
- * the opaque token (`otr_...`) the task hands to the outside world so that
+ * the opaque token (`otr1_...`) the task hands to the outside world so that
  * `app.resolvePromise` / `app.rejectPromise` can settle exactly this one.
  * Redeemed like any other handle, with `ctx.await` / `ctx.all`.
  */
@@ -129,7 +137,7 @@ export interface SpawnEffect {
   label: string;
   taskName: string;
   params: unknown;
-  options: SpawnOptions;
+  options: ChildSpawnOptions;
 }
 
 export interface AwaitEffect {
@@ -172,14 +180,12 @@ export type TaskHandler<P, R> = (
 
 export interface TaskOptions {
   name: string;
-  queue?: string;
   maxAttempts?: number;
   retryStrategy?: RetryStrategy;
 }
 
 export interface RegisteredTask {
   name: string;
-  queue?: string;
   maxAttempts?: number;
   retryStrategy?: RetryStrategy;
   handler: TaskHandler<never, unknown>;

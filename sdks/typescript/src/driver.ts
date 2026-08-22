@@ -109,7 +109,7 @@ export async function driveOnce(
   const { executionId } = claimed;
   const { workerId, claimSeconds, queue } = options;
 
-  const history = await db.loadHistory(executionId);
+  const history = await db.loadHistory(claimed);
   const labelCounts = new Map<string, number>();
   const keyFor = (label: string): string => {
     const n = (labelCounts.get(label) ?? 0) + 1;
@@ -192,7 +192,7 @@ export async function driveOnce(
   /** First delivery: journal the position BEFORE throwing, so a crash after
    *  this write re-delivers at the same yield on replay. */
   const deliverFresh = async (position: CancelPosition): Promise<Resume> => {
-    await db.recordCancel(executionId, workerId, position);
+    await db.recordCancel(claimed, workerId, position);
     cancelDelivered = true;
     return { type: "throw", error: new CancelledError() };
   };
@@ -204,7 +204,7 @@ export async function driveOnce(
   const heartbeatMs = Math.max((claimSeconds * 1000) / 2, 500);
   const heartbeat = setInterval(() => {
     void db
-      .extendClaim(executionId, workerId, claimSeconds)
+      .extendClaim(claimed, workerId, claimSeconds)
       .then(({ cancelRequested }) => {
         if (cancelRequested) markCancelPending();
       })
@@ -217,7 +217,7 @@ export async function driveOnce(
   ): Promise<DriveOutcome> => {
     try {
       const finalized = await db.finalizeCancelled(
-        executionId,
+        claimed,
         workerId,
         error,
       );
@@ -233,7 +233,7 @@ export async function driveOnce(
   ): Promise<DriveOutcome> => {
     try {
       const { applied, failedPermanently } = await db.failAttempt(
-        executionId,
+        claimed,
         workerId,
         payload,
         retryable,
@@ -275,7 +275,7 @@ export async function driveOnce(
     position: CancelPosition,
   ): Promise<DriveOutcome | null> {
     const { suspended, cancelRequested } = await db.suspend(
-      executionId,
+      claimed,
       workerId,
       blockerKeys,
     );
@@ -319,7 +319,7 @@ export async function driveOnce(
         if (cancelDelivered || journaledDelivery)
           return finalizeCancelled(null);
         try {
-          await db.complete(executionId, workerId, step.value);
+          await db.complete(claimed, workerId, step.value);
         } catch (err) {
           return isKilled(err) ? { type: "killed" } : { type: "lost" };
         }
@@ -365,7 +365,7 @@ export async function driveOnce(
             return reportFailedAttempt(serializeError(err), retryable);
           }
           const stored = await db.recordRun(
-            executionId,
+            claimed,
             workerId,
             key,
             effect.label,
@@ -402,7 +402,7 @@ export async function driveOnce(
           }
           if (recorded === undefined) {
             const created = await db.createSleep(
-              executionId,
+              claimed,
               workerId,
               key,
               effect.label,
@@ -451,7 +451,7 @@ export async function driveOnce(
           }
           if (recorded === undefined) {
             const created = await db.createEventWait(
-              executionId,
+              claimed,
               workerId,
               key,
               effect.label,
@@ -507,9 +507,9 @@ export async function driveOnce(
           const spawned = await db.spawn(
             effect.taskName,
             effect.params,
-            effect.options.queue ?? queue,
+            queue,
             effect.options,
-            { executionId, key, label: effect.label, worker: workerId },
+            { execution: claimed, key, label: effect.label, worker: workerId },
           );
           history.set(key, {
             key,
@@ -545,7 +545,7 @@ export async function driveOnce(
                 kind: "otra:handle",
                 key,
                 executionId,
-                token: promiseToken(recorded.id!),
+                token: promiseToken(claimed, recorded.id!),
               },
             };
             break;
@@ -555,7 +555,7 @@ export async function driveOnce(
             break;
           }
           const created = await db.createExternal(
-            executionId,
+            claimed,
             workerId,
             key,
             effect.label,
@@ -577,7 +577,7 @@ export async function driveOnce(
               kind: "otra:handle",
               key,
               executionId,
-              token: promiseToken(created.id),
+              token: promiseToken(claimed, created.id),
             },
           };
           break;
@@ -612,7 +612,7 @@ export async function driveOnce(
             .filter((r) => r.status === "pending")
             .map((r) => r.key);
           if (staleKeys.length > 0) {
-            const fresh = await db.getPromises(executionId, staleKeys);
+            const fresh = await db.getPromises(claimed, staleKeys);
             for (const row of rows) {
               const update = fresh.get(row.key);
               if (update !== undefined && update.status !== "pending") {

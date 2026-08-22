@@ -45,18 +45,18 @@ test("a slow step does not block other executions (no head-of-line blocking)", a
     await arrived;
     // ...but a free slot must still pick up and finish new work.
     const fastSpawn = await app.spawn(fast, null);
-    const fastResult = await app.getResult(fastSpawn.executionId, {
+    const fastResult = await app.getResult(fastSpawn, {
       timeoutMs: 3_000,
     });
     assert.equal(fastResult, "fast-done");
     assert.equal(
-      (await app.getExecution(slowSpawn.executionId))!.status,
+      (await app.getExecution(slowSpawn))!.status,
       "running",
     );
 
     gate.emit("release");
     assert.equal(
-      await app.getResult(slowSpawn.executionId, { timeoutMs: 3_000 }),
+      await app.getResult(slowSpawn, { timeoutMs: 3_000 }),
       "slow-done",
     );
   } finally {
@@ -81,7 +81,9 @@ test("the concurrency cap holds while slots are saturated", async () => {
     return params.id;
   });
 
-  for (let i = 1; i <= 5; i++) await app.spawn(task, { id: i });
+  const spawns = [];
+  for (let i = 1; i <= 5; i++) spawns.push(await app.spawn(task, { id: i }));
+  const executions = `otra.x_${spawns[0]!.queueId.replaceAll("-", "")}`;
 
   const worker = app.createWorker({
     workerId: "w1",
@@ -96,7 +98,7 @@ test("the concurrency cap holds while slots are saturated", async () => {
     await new Promise((resolve) => setTimeout(resolve, 60));
     assert.equal(atGate.size, 2);
     const { rows } = await pool.query(
-      "select count(*)::int as n from otra.executions where status = 'running'",
+      `select count(*)::int as n from ${executions} where status = 'running'`,
     );
     assert.equal(rows[0].n, 2);
 
@@ -106,7 +108,7 @@ test("the concurrency cap holds while slots are saturated", async () => {
       async () => {
         gate.emit("release");
         const { rows: done } = await pool.query(
-          "select count(*)::int as n from otra.executions where status = 'completed'",
+          `select count(*)::int as n from ${executions} where status = 'completed'`,
         );
         return done[0].n === 5;
       },
@@ -134,7 +136,9 @@ test("a freed slot claims new work immediately, not at the next poll", async () 
     return params.id;
   });
 
-  for (let i = 1; i <= 3; i++) await app.spawn(task, { id: i });
+  const spawns = [];
+  for (let i = 1; i <= 3; i++) spawns.push(await app.spawn(task, { id: i }));
+  const executions = `otra.x_${spawns[0]!.queueId.replaceAll("-", "")}`;
 
   // Poll interval of an hour: completion must come from the wake-on-free
   // path, not from polling.
@@ -151,7 +155,7 @@ test("a freed slot claims new work immediately, not at the next poll", async () 
       async () => {
         gate.emit("release");
         const { rows } = await pool.query(
-          "select count(*)::int as n from otra.executions where status = 'completed'",
+          `select count(*)::int as n from ${executions} where status = 'completed'`,
         );
         return rows[0].n === 3;
       },
@@ -204,7 +208,7 @@ test("stop() drains in-flight executions gracefully", async () => {
   gate.emit("release");
   await stopping;
 
-  for (const { executionId } of spawns) {
-    assert.equal((await app.getExecution(executionId))!.status, "completed");
+  for (const execution of spawns) {
+    assert.equal((await app.getExecution(execution))!.status, "completed");
   }
 });

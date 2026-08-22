@@ -16,24 +16,28 @@ test("a zombie worker cannot fail an execution it does not own", async () => {
   app.task("victim", function* (_params: null, ctx) {
     return yield* ctx.run("noop", () => 1);
   });
-  const { executionId } = await app.spawn("victim", null);
+  const execution = await app.spawn("victim", null);
 
   // A live worker claims it...
   const { rows: claimed } = await pool.query(
-    "select * from otra.claim('default', 'worker-live', 30, 1)",
+    "select * from otra.claim_local('default', 'worker-live', 30, 1)",
   );
   assert.equal(claimed.length, 1);
 
   // ...and a worker whose lease was stolen (or never existed) reports a
   // failure.  This must be a no-op: the live worker owns the execution.
   await pool.query(
-    `select * from otra.fail_attempt($1, 'worker-zombie', '{"message":"zombie"}'::jsonb, true)`,
-    [executionId],
+    `select * from otra.fail_attempt_local(
+       $1, $2, $3, 'worker-zombie', '{"message":"zombie"}'::jsonb, true
+     )`,
+    [execution.queueId, execution.rootId, execution.executionId],
   );
 
   const { rows } = await pool.query(
-    "select status, claimed_by, attempt from otra.executions where id = $1",
-    [executionId],
+    `select status, claimed_by, attempt
+       from otra.x_${execution.queueId.replaceAll("-", "")}
+      where root_id = $1 and id = $2`,
+    [execution.rootId, execution.executionId],
   );
   assert.equal(rows[0].status, "running");
   assert.equal(rows[0].claimed_by, "worker-live");
@@ -50,23 +54,25 @@ test("cleanup deletes finished execution trees and old events", async () => {
     return yield* ctx.call(child, null);
   });
 
-  const { executionId } = await app.spawn(parent, null);
+  const execution = await app.spawn(parent, null);
   await app.emitEvent("stale-event", { n: 1 });
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
-  assert.equal((await app.getExecution(executionId))!.status, "completed");
+  assert.equal((await app.getExecution(execution))!.status, "completed");
 
   await env.advance(100 * 86400);
-  await pool.query("select otra.cleanup(interval '30 days')");
+  await pool.query("select otra.cleanup_local('default', interval '30 days')");
+
+  const storage = execution.queueId.replaceAll("-", "");
 
   const { rows: executions } = await pool.query(
-    "select count(*)::int as n from otra.executions",
+    `select count(*)::int as n from otra.x_${storage}`,
   );
   const { rows: promises } = await pool.query(
-    "select count(*)::int as n from otra.promises",
+    `select count(*)::int as n from otra.p_${storage}`,
   );
   const { rows: events } = await pool.query(
-    "select count(*)::int as n from otra.events",
+    `select count(*)::int as n from otra.e_${storage}`,
   );
   assert.equal(executions[0].n, 0);
   assert.equal(promises[0].n, 0);
@@ -74,35 +80,41 @@ test("cleanup deletes finished execution trees and old events", async () => {
 });
 
 test("claiming one queue does not fire another queue's timers", async () => {
-  const { pool } = env;
+  const { app, pool } = env;
+  await app.createQueue("queue-a");
+  await app.createQueue("queue-b");
 
   const { rows: spawned } = await pool.query(
-    "select execution_id from otra.spawn('sleeper', '{}'::jsonb, 'queue-b')",
+    "select queue_id, root_id, execution_id from otra.spawn_local('sleeper', '{}'::jsonb, 'queue-b')",
   );
-  const executionId = spawned[0].execution_id;
-  await pool.query("select * from otra.claim('queue-b', 'w1', 30, 1)");
+  const execution = spawned[0];
+  await pool.query("select * from otra.claim_local('queue-b', 'w1', 30, 1)");
   await pool.query(
-    "select * from otra.create_sleep($1, 'w1', 's1', '$sleep', 60)",
-    [executionId],
+    "select * from otra.create_sleep_local($1, $2, $3, 'w1', 's1', '$sleep', 60)",
+    [execution.queue_id, execution.root_id, execution.execution_id],
   );
-  await pool.query("select otra.suspend($1, 'w1', array['s1'])", [executionId]);
+  await pool.query(
+    "select otra.suspend_local($1, $2, $3, 'w1', array['s1'])",
+    [execution.queue_id, execution.root_id, execution.execution_id],
+  );
 
   await env.advance(61);
 
   // A worker on queue-a sweeps; queue-b's timer is not its business.
-  await pool.query("select * from otra.claim('queue-a', 'w2', 30, 5)");
+  await pool.query("select * from otra.claim_local('queue-a', 'w2', 30, 5)");
   const { rows: after } = await pool.query(
-    "select status from otra.promises where execution_id = $1 and key = 's1'",
-    [executionId],
+    `select status from otra.p_${execution.queue_id.replaceAll("-", "")}
+      where root_id = $1 and execution_id = $2 and key = 's1'`,
+    [execution.root_id, execution.execution_id],
   );
   assert.equal(after[0].status, "pending");
 
   // A worker on queue-b fires it and claims the woken execution.
   const { rows: claimed } = await pool.query(
-    "select * from otra.claim('queue-b', 'w1', 30, 5)",
+    "select * from otra.claim_local('queue-b', 'w1', 30, 5)",
   );
   assert.equal(claimed.length, 1);
-  assert.equal(claimed[0].execution_id, executionId);
+  assert.equal(claimed[0].execution_id, execution.execution_id);
 });
 
 test("exponential backoff saturates instead of overflowing at high attempts", async () => {
@@ -132,7 +144,9 @@ test("top-level spawns with an idempotency key never duplicate", async () => {
   assert.equal(ids.size, 1);
 
   const { rows } = await pool.query(
-    "select count(*)::int as n from otra.executions where function_name = 'webhook-handler'",
+    `select count(*)::int as n
+       from otra.x_${spawns[0]!.queueId.replaceAll("-", "")}
+      where function_name = 'webhook-handler'`,
   );
   assert.equal(rows[0].n, 1);
 
@@ -161,8 +175,8 @@ test("two workers racing over one queue never double-execute", async () => {
   const w2 = app.createWorker({ workerId: "wb", batchSize: 3 });
   await Promise.all([w1.drain(), w2.drain()]);
 
-  for (const { executionId } of spawned) {
-    assert.equal((await app.getExecution(executionId))!.status, "completed");
+  for (const execution of spawned) {
+    assert.equal((await app.getExecution(execution))!.status, "completed");
   }
   assert.equal(executed.size, count);
   for (const [i, times] of executed) {
