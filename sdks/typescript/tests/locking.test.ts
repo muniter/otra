@@ -15,9 +15,6 @@ import { createTestEnv, waitFor, type TestEnv } from "./helpers.ts";
 // wakeups" claim, argued in a comment in sql/schema.sql -- into something
 // the suite actually forces and verifies, in both interleavings.
 
-const DSN =
-  process.env.OTRA_TEST_DB ?? "postgres://postgres@127.0.0.1:5433/postgres";
-
 let env: TestEnv;
 let a: pg.Client;
 let b: pg.Client;
@@ -25,8 +22,8 @@ let bPid: number;
 
 beforeEach(async () => {
   env = await createTestEnv();
-  a = new pg.Client({ connectionString: DSN });
-  b = new pg.Client({ connectionString: DSN });
+  a = new pg.Client({ connectionString: env.connectionString });
+  b = new pg.Client({ connectionString: env.connectionString });
   await a.connect();
   await b.connect();
   const { rows } = await b.query("select pg_backend_pid() as pid");

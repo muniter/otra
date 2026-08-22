@@ -14,9 +14,6 @@ import { createTestEnv, waitFor, type TestEnv } from "./helpers.ts";
 // ctx.run steps, which checkpoint normally. The engine owns the terminal
 // state. kill() is the escape hatch: immediate, no compensation (OT002).
 
-const DSN =
-  process.env.OTRA_TEST_DB ?? "postgres://postgres@127.0.0.1:5433/postgres";
-
 let env: TestEnv;
 beforeEach(async () => {
   env = await createTestEnv();
@@ -390,8 +387,8 @@ test("ctx.uninterruptible defers delivery until the critical section exits", asy
 
 test("cancel-vs-suspend race converges in both interleavings", async () => {
   const { pool } = env;
-  const a = new pg.Client({ connectionString: DSN });
-  const b = new pg.Client({ connectionString: DSN });
+  const a = new pg.Client({ connectionString: env.connectionString });
+  const b = new pg.Client({ connectionString: env.connectionString });
   await a.connect();
   await b.connect();
   const { rows: pid } = await b.query("select pg_backend_pid() as pid");

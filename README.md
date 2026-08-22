@@ -231,9 +231,12 @@ Two details worth stealing even if you throw the rest away:
 ## Testing
 
 Tests are plain `node:test` against a real Postgres. `make test` starts a
-Postgres 16 Testcontainer, while `OTRA_TEST_DB` can point the suite at an
-existing Postgres 14 or newer. Database time is frozen via
-`otra.set_fake_now()` (stored in a table, not a GUC, so every pooled
+Postgres 16 Testcontainer, prepares one schema-bearing template database, and
+runs up to eight test files in parallel against disposable database clones.
+`OTRA_TEST_CONCURRENCY` overrides that limit. `OTRA_TEST_DB` can point the
+suite at an existing Postgres 14 or newer; that mode runs serially and resets
+the supplied database's `otra` schema between tests. Database time is frozen
+via `otra.set_fake_now()` (stored in a table, not a GUC, so every pooled
 connection sees the same fake clock — no `max: 1` workaround needed):
 
 ```bash

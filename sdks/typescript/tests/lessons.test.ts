@@ -9,9 +9,6 @@ import { createTestEnv, type TestEnv } from "./helpers.ts";
 // Regression tests for bug classes mined from absurd's commit history.
 // Each comment cites the absurd commit that motivated the test.
 
-const DSN =
-  process.env.OTRA_TEST_DB ?? "postgres://postgres@127.0.0.1:5433/postgres";
-
 let env: TestEnv;
 beforeEach(async () => {
   env = await createTestEnv();
@@ -48,8 +45,8 @@ test("await/emit race cannot lose the wakeup (absurd bcde0df, #61)", async () =>
   const { pool } = env;
   const executionId = await claimedExecution(pool);
 
-  const a = new pg.Client({ connectionString: DSN });
-  const b = new pg.Client({ connectionString: DSN });
+  const a = new pg.Client({ connectionString: env.connectionString });
+  const b = new pg.Client({ connectionString: env.connectionString });
   await a.connect();
   await b.connect();
   try {

@@ -68,12 +68,14 @@ systems, and the decisions already made so you don't relitigate them.
 - **TDD is the house rule.** Every behavior change lands as a failing test
   first; run it red, implement, run the full suite. Regression tests cite
   what motivated them (several cite absurd commits — keep that habit).
-- **Tests run against real Postgres.** `make test` starts a
-  session-scoped Postgres 16 Testcontainer. Set
+- **Tests run against real Postgres.** `make test` starts a session-scoped
+  Postgres 16 Testcontainer, applies the schema to a template database, and
+  gives each test an isolated clone. Test files run eight-wide by default;
+  `OTRA_TEST_CONCURRENCY` overrides the limit. Set
   `OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres` to use an
-  existing database instead. Each test drops and re-applies the `otra`
-  schema. Root commands are `make install`, `make check`, `make build`, and
-  `make test`.
+  existing database instead; that mode runs serially and resets its `otra`
+  schema per test. Root commands are `make install`, `make check`,
+  `make build`, and `make test`.
 - **Local Postgres quickstart** (any PG ≥ 14; as root you must run it as the
   postgres user):
   ```sh
