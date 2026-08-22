@@ -38,9 +38,14 @@ async function claimedExecution(
 }
 
 /** Steal w1's claim: expire it, sweep, wait out the backoff, claim as w2. */
-async function stealClaim(env: TestEnv, execution: ExecutionRef): Promise<void> {
+async function stealClaim(
+  env: TestEnv,
+  execution: ExecutionRef,
+): Promise<void> {
   await env.advance(31);
-  await env.pool.query("select * from otra.claim_local('default', 'w2', 30, 5)");
+  await env.pool.query(
+    "select * from otra.claim_local('default', 'w2', 30, 5)",
+  );
   await env.advance(2);
   const { rows } = await env.pool.query(
     "select execution_id from otra.claim_local('default', 'w2', 30, 5)",
@@ -201,7 +206,9 @@ test("cleanup is bounded by a batch limit", async () => {
   await worker.drain();
 
   await env.advance(100 * 86400);
-  await pool.query("select otra.cleanup_local('default', interval '30 days', 2)");
+  await pool.query(
+    "select otra.cleanup_local('default', interval '30 days', 2)",
+  );
   const { rows } = await pool.query(
     `select count(*)::int as n
        from otra.x_${executions[0]!.queueId.replaceAll("-", "")}`,
@@ -226,7 +233,9 @@ test("cleanup never deletes a tree with live descendants (fire-and-forget child)
   assert.equal((await app.getExecution(execution))!.status, "completed");
 
   await env.advance(100 * 86400);
-  await pool.query("select otra.cleanup_local('default', interval '30 days', 100)");
+  await pool.query(
+    "select otra.cleanup_local('default', interval '30 days', 100)",
+  );
 
   // Parent finished 100 days ago, but its child is still suspended: the
   // whole tree must survive until the subtree is terminal.

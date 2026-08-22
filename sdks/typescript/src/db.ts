@@ -701,6 +701,12 @@ export class Db {
     ]);
   }
 
+  /** Database clock (otra.now()), epoch milliseconds -- honors the fake clock. */
+  async now(): Promise<number> {
+    const { rows } = await this.client.query(`select otra.now() as now`);
+    return (rows[0].now as Date).getTime();
+  }
+
   async getExecution(
     execution: ExecutionRef,
   ): Promise<ExecutionSnapshot | null> {

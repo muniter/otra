@@ -93,10 +93,11 @@ test("claiming one queue does not fire another queue's timers", async () => {
     "select * from otra.create_sleep_local($1, $2, $3, 'w1', 's1', '$sleep', 60)",
     [execution.queue_id, execution.root_id, execution.execution_id],
   );
-  await pool.query(
-    "select otra.suspend_local($1, $2, $3, 'w1', array['s1'])",
-    [execution.queue_id, execution.root_id, execution.execution_id],
-  );
+  await pool.query("select otra.suspend_local($1, $2, $3, 'w1', array['s1'])", [
+    execution.queue_id,
+    execution.root_id,
+    execution.execution_id,
+  ]);
 
   await env.advance(61);
 

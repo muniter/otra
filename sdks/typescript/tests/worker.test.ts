@@ -49,10 +49,7 @@ test("a slow step does not block other executions (no head-of-line blocking)", a
       timeoutMs: 3_000,
     });
     assert.equal(fastResult, "fast-done");
-    assert.equal(
-      (await app.getExecution(slowSpawn))!.status,
-      "running",
-    );
+    assert.equal((await app.getExecution(slowSpawn))!.status, "running");
 
     gate.emit("release");
     assert.equal(

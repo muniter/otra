@@ -95,6 +95,7 @@ export class Worker {
         queue: this.queue,
         workerId: this.workerId,
         claimSeconds: this.claimSeconds,
+        registry: this.registry,
       });
       let redrives = 0;
       while (outcome.type === "redrive") {
@@ -107,6 +108,7 @@ export class Worker {
           queue: this.queue,
           workerId: this.workerId,
           claimSeconds: this.claimSeconds,
+          registry: this.registry,
         });
       }
       return outcome;

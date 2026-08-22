@@ -72,21 +72,25 @@ export class Ctx {
    */
   cancelRequested = false;
   /**
-   * Aborted when cancellation is requested -- pass it to fetch, child
-   * processes, etc. inside ctx.run callbacks to stop in-flight I/O early.
+   * Aborted when cancellation is requested, the execution is killed, or the
+   * worker loses its claim -- pass it to fetch, child processes, etc. inside
+   * ctx.run callbacks to stop in-flight I/O early.
    */
   readonly signal: AbortSignal;
+  private readonly nowFn: () => number | Promise<number>;
 
   constructor(
     executionId: string,
     attempt: number,
     queue: string,
     signal?: AbortSignal,
+    nowFn?: () => number | Promise<number>,
   ) {
     this.executionId = executionId;
     this.attempt = attempt;
     this.queue = queue;
     this.signal = signal ?? new AbortController().signal;
+    this.nowFn = nowFn ?? (() => Date.now());
   }
 
   /** Throw CancelledError now if a cancel is pending (for long loops). */
@@ -225,12 +229,16 @@ export class Ctx {
     return yield* this.await(handle);
   }
 
-  /** Deterministic current time (epoch ms), memoized on first execution. */
+  /**
+   * Deterministic current time (epoch ms), memoized on first execution.
+   * Reads the DATABASE clock (otra.now()), so it agrees with sleep timers,
+   * timeouts, and the frozen test clock.
+   */
   now(label = "$now"): Op<number> {
     return op({
       type: "run",
       label: userLabel(label, "$now"),
-      fn: () => Date.now(),
+      fn: () => this.nowFn(),
     });
   }
 

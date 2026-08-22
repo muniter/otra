@@ -123,3 +123,16 @@ test("replay divergence is detected and fails permanently", async () => {
   // Non-retryable: it failed on the first divergent attempt.
   assert.equal(snapshot.attempt, 1);
 });
+
+test("ctx.now() reads the database clock, so the fake clock governs it", async () => {
+  const { app } = env;
+  const task = app.task("what-time", function* (_params: null, ctx) {
+    return yield* ctx.now();
+  });
+  const execution = await app.spawn(task, null);
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick();
+  const result = await app.getResult<number>(execution);
+  // helpers.ts freezes otra.now() at 2026-01-01T00:00:00Z.
+  assert.equal(result, Date.parse("2026-01-01T00:00:00Z"));
+});

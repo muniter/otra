@@ -123,7 +123,9 @@ test("a crashed worker's claim expires and another worker resumes the task", asy
 
   // Worker A claims the execution, writes the first checkpoint, then "dies"
   // (we simulate the crash by doing both directly, without ever finishing).
-  await pool.query("select * from otra.claim_local('default', 'worker-a', 30, 1)");
+  await pool.query(
+    "select * from otra.claim_local('default', 'worker-a', 30, 1)",
+  );
   await pool.query(
     `select otra.record_run_local(
        $1, $2, $3, 'worker-a', 'before-crash', 'before-crash',

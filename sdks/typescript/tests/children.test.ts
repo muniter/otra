@@ -205,3 +205,38 @@ test("grandchildren: failures are contained to their branch", async () => {
   await worker.drain();
   assert.deepEqual(await app.getResult(execution), ["bad-failed", "ok"]);
 });
+
+test("ctx.spawn honors the child task's registered retry policy", async () => {
+  const { app, pool } = env;
+  const child = app.task(
+    {
+      name: "picky-child",
+      maxAttempts: 7,
+      retryStrategy: { kind: "fixed", base_s: 9 },
+    },
+    function* () {
+      return "ok";
+    },
+  );
+  app.task("spawning-parent", function* (_params: null, ctx) {
+    const handle = yield* ctx.spawn(child, null);
+    return yield* ctx.await(handle);
+  });
+  const execution = await app.spawn("spawning-parent", null);
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.drain();
+
+  const { rows: q } = await pool.query(
+    "select replace(id::text, '-', '') as s from otra.queues where name = 'default'",
+  );
+  const { rows } = await pool.query(
+    `select max_attempts, retry_strategy from otra.x_${q[0].s}
+      where root_id = $1 and id <> $2`,
+    [execution.rootId, execution.executionId],
+  );
+  // Previously the child silently got the SQL defaults (5 attempts,
+  // exponential) because the driver forwarded only per-spawn options.
+  assert.equal(rows[0].max_attempts, 7);
+  assert.equal(rows[0].retry_strategy.kind, "fixed");
+  assert.equal(rows[0].retry_strategy.base_s, 9);
+});

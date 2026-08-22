@@ -24,6 +24,8 @@ export interface DriveOptions {
   queue: string;
   workerId: string;
   claimSeconds: number;
+  /** Task registry, so child spawns inherit their task's registered policy. */
+  registry?: Map<string, RegisteredTask>;
 }
 
 export type DriveOutcome =
@@ -137,7 +139,9 @@ export async function driveOnce(
 
   // --- cancellation state ---------------------------------------------------
   const abort = new AbortController();
-  const ctx = new Ctx(executionId, claimed.attempt, queue, abort.signal);
+  const ctx = new Ctx(executionId, claimed.attempt, queue, abort.signal, () =>
+    db.now(),
+  );
   let cancelPending = false;
   let cancelDelivered = false;
   let shielded = 0;
@@ -567,11 +571,19 @@ export async function driveOnce(
             resume = await deliverFresh({ key });
             break;
           }
+          // Per-spawn options win; otherwise the child task's registered
+          // policy applies (matching app.spawn), not the SQL defaults.
+          const childTask = options.registry?.get(effect.taskName);
           const spawned = await db.spawn(
             effect.taskName,
             effect.params,
             queue,
-            effect.options,
+            {
+              ...effect.options,
+              maxAttempts: effect.options.maxAttempts ?? childTask?.maxAttempts,
+              retryStrategy:
+                effect.options.retryStrategy ?? childTask?.retryStrategy,
+            },
             { execution: claimed, key, label: effect.label, worker: workerId },
           );
           history.set(key, {
