@@ -343,72 +343,249 @@ begin
     'pi_' || v_storage || '_ci',
     v_p
   );
+  -- cleanup_local's candidate scan: terminal roots ordered by finished_at.
+  execute format(
+    'create index if not exists %I on otra.%I (finished_at)
+      where root_id = id and status in (''completed'', ''failed'', ''cancelled'')',
+    'xi_' || v_storage || '_fin',
+    v_x
+  );
+  -- cleanup_local's event-TTL batch orders by created_at.
+  execute format(
+    'create index if not exists %I on otra.%I (created_at)',
+    'ei_' || v_storage || '_ci',
+    v_e
+  );
+  if v_mode = 'partitioned' then
+    -- cleanup_local deletes idempotency registrations by root.
+    execute format(
+      'create index if not exists %I on otra.%I (root_id)',
+      'ii_' || v_storage || '_ri',
+      v_i
+    );
+  end if;
 end;
 $$ language plpgsql;
 
-create or replace function otra.ensure_partitions (p_name text default null) returns void as $$
+-- Provision one week window for a queue's execution+promise pair.  Handles
+-- the default-partition wedge: rows that landed in the default while
+-- maintenance lapsed are DRAINED into the new week partition before it is
+-- attached (plain CREATE ... PARTITION OF fails permanently against a
+-- non-empty default -- Postgres re-validates the default's constraint).
+-- Runs under the caller's FOR UPDATE queue barrier, so no spawn/claim
+-- (FOR KEY SHARE) can write concurrently.  Move order is FK-driven: promise
+-- rows in range are parked in a temp table and their originals deleted
+-- FIRST, so moving execution rows (delete + reinsert) cannot cascade away
+-- live history; executions attach before promises so the promise reinsert
+-- routes against visible referents.
+create or replace function otra._ensure_week_partitions (
+  p_x text, p_p text, p_tag text, p_lower uuid, p_upper uuid
+) returns void as $$
 declare
-  v_now timestamptz := otra.now();
+  v_x_part text := p_x || '_' || p_tag;
+  v_p_part text := p_p || '_' || p_tag;
+  v_need_x boolean := to_regclass('otra.' || v_x_part) is null;
+  v_need_p boolean := to_regclass('otra.' || v_p_part) is null;
+  v_x_d text := p_x || '_d';
+  v_p_d text := p_p || '_d';
+  v_stranded boolean := false;
+begin
+  if not v_need_x and not v_need_p then
+    return;
+  end if;
+
+  if to_regclass('otra.' || v_x_d) is not null then
+    execute format(
+      'select exists (select 1 from otra.%I where root_id >= %L::uuid and root_id < %L::uuid)',
+      v_x_d, p_lower, p_upper
+    ) into v_stranded;
+  end if;
+  if not v_stranded and to_regclass('otra.' || v_p_d) is not null then
+    execute format(
+      'select exists (select 1 from otra.%I where root_id >= %L::uuid and root_id < %L::uuid)',
+      v_p_d, p_lower, p_upper
+    ) into v_stranded;
+  end if;
+
+  if not v_stranded then
+    -- Fast path: an empty (or absent) default validates instantly.
+    if v_need_x then
+      execute format(
+        'create table if not exists otra.%I partition of otra.%I
+         for values from (%L::uuid) to (%L::uuid)',
+        v_x_part, p_x, p_lower, p_upper
+      );
+    end if;
+    if v_need_p then
+      execute format(
+        'create table if not exists otra.%I partition of otra.%I
+         for values from (%L::uuid) to (%L::uuid)',
+        v_p_part, p_p, p_lower, p_upper
+      );
+    end if;
+    return;
+  end if;
+
+  -- Park every promise row of the affected trees (reading through the
+  -- parent covers both the default and any attached partition) and delete
+  -- the originals, so the execution move below cannot cascade them away.
+  execute format(
+    'create temp table otra_drain_p on commit drop as
+     select * from otra.%I where root_id >= %L::uuid and root_id < %L::uuid',
+    p_p, p_lower, p_upper
+  );
+  execute format(
+    'delete from otra.%I where root_id >= %L::uuid and root_id < %L::uuid',
+    p_p, p_lower, p_upper
+  );
+
+  if v_need_x then
+    execute format(
+      'create table otra.%I (like otra.%I including all)', v_x_part, p_x
+    );
+    execute format(
+      'insert into otra.%I select * from otra.%I
+        where root_id >= %L::uuid and root_id < %L::uuid',
+      v_x_part, v_x_d, p_lower, p_upper
+    );
+    execute format(
+      'delete from otra.%I where root_id >= %L::uuid and root_id < %L::uuid',
+      v_x_d, p_lower, p_upper
+    );
+    execute format(
+      'alter table otra.%I attach partition otra.%I
+       for values from (%L::uuid) to (%L::uuid)',
+      p_x, v_x_part, p_lower, p_upper
+    );
+  end if;
+
+  if v_need_p then
+    execute format(
+      'create table if not exists otra.%I partition of otra.%I
+       for values from (%L::uuid) to (%L::uuid)',
+      v_p_part, p_p, p_lower, p_upper
+    );
+  end if;
+  execute format('insert into otra.%I select * from otra_drain_p', p_p);
+  drop table otra_drain_p;
+end;
+$$ language plpgsql;
+
+-- Provision the partition window for one queue.  A cheap unlocked probe
+-- skips fully-provisioned queues without touching the queue barrier (the
+-- common no-op run must not block spawn/claim); otherwise the barrier is
+-- taken and the policy re-read under it.
+create or replace function otra._ensure_queue_partitions (p_queue uuid) returns void as $$
+declare
+  v_row otra.queues%rowtype;
+  v_now timestamptz;
   v_start timestamptz;
   v_end timestamptz;
   v_week timestamptz;
   v_next timestamptz;
-  v_lower uuid;
-  v_upper uuid;
-  v_tag text;
   v_storage text;
   v_x text;
   v_p text;
-  v_queue record;
+  v_missing boolean := false;
 begin
-  if p_name is not null and not exists (select 1 from otra.queues where name = p_name) then
-    raise exception 'Queue "%" does not exist', p_name;
+  select * into v_row from otra.queues where id = p_queue;
+  if not found or v_row.storage_mode <> 'partitioned' then
+    return;
+  end if;
+  v_storage := replace(p_queue::text, '-', '');
+  v_x := 'x_' || v_storage;
+  v_p := 'p_' || v_storage;
+  v_now := otra.now();
+  v_start := otra.week_bucket_utc(v_now - v_row.partition_lookback);
+  v_end := otra.week_bucket_utc(v_now + v_row.partition_lookahead);
+
+  if v_row.default_partition = 'enabled'
+     and (to_regclass('otra.' || v_x || '_d') is null
+          or to_regclass('otra.' || v_p || '_d') is null) then
+    v_missing := true;
+  end if;
+  v_week := v_start;
+  while not v_missing and v_week <= v_end loop
+    if to_regclass('otra.' || v_x || '_' || otra.partition_week_tag(v_week)) is null
+       or to_regclass('otra.' || v_p || '_' || otra.partition_week_tag(v_week)) is null then
+      v_missing := true;
+    end if;
+    -- Stepping through week_bucket_utc keeps the walk in UTC: plain
+    -- "+ interval '7 days'" is evaluated in the session time zone, and a
+    -- DST spring-forward makes it land inside the SAME ISO week -- the next
+    -- window then gets the same tag and a whole week goes uncovered.
+    v_week := otra.week_bucket_utc(v_week + interval '8 days');
+  end loop;
+  if not v_missing then
+    return;
+  end if;
+
+  -- Re-read under the maintenance barrier; spawn/claim (FOR KEY SHARE)
+  -- block for this queue only while real DDL work happens.
+  select * into v_row from otra.queues where id = p_queue for update;
+
+  if v_row.default_partition = 'enabled' then
+    execute format(
+      'create table if not exists otra.%I partition of otra.%I default',
+      v_x || '_d', v_x
+    );
+    execute format(
+      'create table if not exists otra.%I partition of otra.%I default',
+      v_p || '_d', v_p
+    );
+  end if;
+
+  v_start := otra.week_bucket_utc(v_now - v_row.partition_lookback);
+  v_end := otra.week_bucket_utc(v_now + v_row.partition_lookahead);
+  v_week := v_start;
+  while v_week <= v_end loop
+    v_next := otra.week_bucket_utc(v_week + interval '8 days');
+    perform otra._ensure_week_partitions(
+      v_x, v_p, otra.partition_week_tag(v_week),
+      otra.uuid_v7_floor(v_week), otra.uuid_v7_floor(v_next)
+    );
+    v_week := v_next;
+  end loop;
+end;
+$$ language plpgsql;
+
+-- Provision partition windows.  With a name: that queue, loudly.  With no
+-- name: every partitioned queue, each isolated in its own subtransaction so
+-- one failing queue cannot poison the whole maintenance run.  NOTE: a
+-- multi-queue run still holds each queue's barrier until this transaction
+-- commits; schedulers should prefer one call per queue per transaction (the
+-- SDK's ensurePartitions() does exactly that).
+create or replace function otra.ensure_partitions (p_name text default null) returns void as $$
+declare
+  v_queue record;
+  v_mode text;
+begin
+  if p_name is not null then
+    select storage_mode into v_mode from otra.queues where name = p_name;
+    if v_mode is null then
+      raise exception 'Queue "%" does not exist', p_name;
+    end if;
+    if v_mode <> 'partitioned' then
+      raise exception 'Queue "%" is not partitioned', p_name;
+    end if;
   end if;
 
   for v_queue in
-    select q.id, q.name, q.default_partition,
-           q.partition_lookahead, q.partition_lookback
-      from otra.queues q
+    select q.id, q.name from otra.queues q
      where q.storage_mode = 'partitioned'
        and (p_name is null or q.name = p_name)
      order by q.id
-       for update
   loop
-    v_storage := replace(v_queue.id::text, '-', '');
-    v_x := 'x_' || v_storage;
-    v_p := 'p_' || v_storage;
-    v_start := otra.week_bucket_utc(v_now - v_queue.partition_lookback);
-    v_end := otra.week_bucket_utc(v_now + v_queue.partition_lookahead);
-
-    if v_queue.default_partition = 'enabled' then
-      execute format(
-        'create table if not exists otra.%I partition of otra.%I default',
-        v_x || '_d', v_x
-      );
-      execute format(
-        'create table if not exists otra.%I partition of otra.%I default',
-        v_p || '_d', v_p
-      );
+    if p_name is not null then
+      perform otra._ensure_queue_partitions(v_queue.id);
+    else
+      begin
+        perform otra._ensure_queue_partitions(v_queue.id);
+      exception when others then
+        raise warning 'otra.ensure_partitions: queue "%" failed: %',
+          v_queue.name, sqlerrm;
+      end;
     end if;
-
-    v_week := v_start;
-    while v_week <= v_end loop
-      v_next := v_week + interval '7 days';
-      v_tag := otra.partition_week_tag(v_week);
-      v_lower := otra.uuid_v7_floor(v_week);
-      v_upper := otra.uuid_v7_floor(v_next);
-      execute format(
-        'create table if not exists otra.%I partition of otra.%I
-         for values from (%L::uuid) to (%L::uuid)',
-        v_x || '_' || v_tag, v_x, v_lower, v_upper
-      );
-      execute format(
-        'create table if not exists otra.%I partition of otra.%I
-         for values from (%L::uuid) to (%L::uuid)',
-        v_p || '_' || v_tag, v_p, v_lower, v_upper
-      );
-      v_week := v_next;
-    end loop;
   end loop;
 end;
 $$ language plpgsql;
@@ -996,7 +1173,7 @@ begin
         where p.root_id = due.root_id and p.id = due.id
        returning p.root_id, p.execution_id
      ) select root_id, array_agg(distinct execution_id) as owners
-         from fired group by root_id',
+         from fired group by root_id order by root_id',
     v_p, v_p
   ) using v_now loop
     perform otra._wake_local(v_queue_id, v_woken.root_id, v_woken.owners);
@@ -1021,23 +1198,28 @@ begin
         where p.root_id = due.root_id and p.id = due.id
        returning p.root_id, p.execution_id
      ) select root_id, array_agg(distinct execution_id) as owners
-         from timed_out group by root_id',
+         from timed_out group by root_id order by root_id',
     v_p, v_p
   ) using v_now loop
     perform otra._wake_local(v_queue_id, v_woken.root_id, v_woken.owners);
   end loop;
 
+  -- Candidates are read WITHOUT locks: _fail_attempt_local acquires its
+  -- ordered (self + parent) locks itself and re-checks expiry under them.
+  -- Pre-locking children here would invert the global lock order against
+  -- the walkers and terminal transitions.
   for v_crashed in execute format(
     'select root_id, id from otra.%I
       where status = ''running'' and claim_expires_at <= $1
-      order by claim_expires_at, id limit 100 for update skip locked',
+      order by claim_expires_at, id limit 100',
     v_x
   ) using v_now loop
     perform * from otra._fail_attempt_local(
       v_queue_id, v_crashed.root_id, v_crashed.id,
       jsonb_build_object('name', 'ClaimExpiredError',
                          'message', 'worker claim expired before completion'),
-      true
+      true,
+      p_only_if_expired => true
     );
   end loop;
 
@@ -1117,6 +1299,8 @@ begin
   v_storage := replace(p_queue::text, '-', '');
   v_x := 'x_' || v_storage;
   v_p := 'p_' || v_storage;
+  -- Global lock order: self + parent, ascending by id, before any write.
+  perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
     'select exists (
        select 1 from otra.%I
@@ -1206,6 +1390,34 @@ begin
 end;
 $$ language plpgsql;
 
+-- Lock the executions every terminal transition of p_execution touches: the
+-- row itself plus its parent (whose child-promise rows get settled and whose
+-- execution row _wake_local then locks).  Acquired in ascending id order --
+-- the one global lock order shared with the cancel/kill tree walks,
+-- _wake_local, and cleanup.  NOTE: uuid_v7 ids created in the same
+-- millisecond are NOT guaranteed parent-before-child, which is exactly why
+-- this orders by id instead of by tree position.  Rows may be gone (cleaned
+-- up); callers re-check what they need with the conditional writes they
+-- already do.
+create or replace function otra._lock_terminal_scope (
+  p_x text, p_root uuid, p_execution uuid
+) returns void as $$
+declare
+  v_parent uuid;
+begin
+  execute format(
+    'select parent_id from otra.%I where root_id = $1 and id = $2',
+    p_x
+  ) into v_parent using p_root, p_execution;
+  execute format(
+    'select 1 from otra.%I
+      where root_id = $1 and id = any ($2)
+      order by id for update',
+    p_x
+  ) using p_root, array_remove(array[p_execution, v_parent], null);
+end;
+$$ language plpgsql;
+
 create or replace function otra._wake_local (
   p_queue uuid,
   p_root uuid,
@@ -1213,6 +1425,7 @@ create or replace function otra._wake_local (
 ) returns void as $$
 declare
   v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_woken int;
   v_name text;
 begin
   if p_execution_ids is null or array_length(p_execution_ids, 1) is null then
@@ -1230,8 +1443,11 @@ begin
       where root_id = $1 and id = any ($2) and status = ''suspended''',
     v_x
   ) using p_root, p_execution_ids;
-  select q.name into v_name from otra.queues q where q.id = p_queue;
-  perform pg_notify('otra_wake', v_name);
+  get diagnostics v_woken = row_count;
+  if v_woken > 0 then
+    select q.name into v_name from otra.queues q where q.id = p_queue;
+    perform pg_notify('otra_wake', v_name);
+  end if;
 end;
 $$ language plpgsql;
 
@@ -1504,7 +1720,7 @@ begin
         where kind = ''event'' and status = ''pending'' and event_name = $2
        returning root_id, execution_id
      ) select root_id, array_agg(distinct execution_id) as owners
-         from settled group by root_id',
+         from settled group by root_id order by root_id',
     v_p
   ) using p_payload, p_name loop
     perform otra._wake_local(v_queue_id, v_woken.root_id, v_woken.owners);
@@ -1660,10 +1876,13 @@ begin
 end;
 $$ language plpgsql;
 
+drop function if exists otra._fail_attempt_local (uuid, uuid, uuid, jsonb, boolean);
 create or replace function otra._fail_attempt_local (
   p_queue uuid, p_root uuid, p_execution uuid,
-  p_error jsonb, p_retryable boolean
-) returns table (failed_permanently boolean, retry_at timestamptz) as $$
+  p_error jsonb, p_retryable boolean,
+  p_worker text default null,
+  p_only_if_expired boolean default false
+) returns table (applied boolean, failed_permanently boolean, retry_at timestamptz) as $$
 declare
   v_storage text := replace(p_queue::text, '-', '');
   v_x text := 'x_' || v_storage;
@@ -1672,13 +1891,32 @@ declare
   v_delivered boolean;
   v_retry_at timestamptz;
 begin
+  -- Global lock order (self + parent ascending) BEFORE reading state, so a
+  -- failure transition can never hold the child while waiting on a walker
+  -- that holds the parent.
+  perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
-    'select status, attempt, max_attempts, retry_strategy, cancel_requested_at
-       from otra.%I where root_id = $1 and id = $2 for update',
+    'select status, attempt, max_attempts, retry_strategy, cancel_requested_at,
+            claimed_by, claim_expires_at
+       from otra.%I where root_id = $1 and id = $2',
     v_x
   ) into v_row using p_root, p_execution;
   if v_row.status is null or v_row.status in ('completed', 'failed', 'cancelled') then
-    return query select false, null::timestamptz; return;
+    return query select false, false, null::timestamptz; return;
+  end if;
+  -- Ownership guard (when a worker reports the failure): a zombie whose
+  -- lease was stolen must not knock a live worker's execution back.
+  if p_worker is not null
+     and (v_row.status <> 'running' or v_row.claimed_by is distinct from p_worker) then
+    return query select false, false, null::timestamptz; return;
+  end if;
+  -- Expiry guard (when the claim sweep reports it): the candidate was read
+  -- without a lock, so re-check under it -- another sweep may have won.
+  if p_only_if_expired
+     and (v_row.status <> 'running'
+          or v_row.claim_expires_at is null
+          or v_row.claim_expires_at > otra.now()) then
+    return query select false, false, null::timestamptz; return;
   end if;
   if p_retryable and v_row.attempt + 1 < v_row.max_attempts then
     execute format(
@@ -1709,7 +1947,7 @@ begin
         where root_id = $3 and id = $4',
       v_x
     ) using v_retry_at, p_error, p_root, p_execution;
-    return query select false, v_retry_at;
+    return query select true, false, v_retry_at;
   else
     execute format(
       'update otra.%I
@@ -1726,7 +1964,7 @@ begin
         jsonb_build_object('name', 'CancelledError', 'message', 'execution was cancelled')
       else p_error end
     );
-    return query select true, null::timestamptz;
+    return query select true, true, null::timestamptz;
   end if;
 end;
 $$ language plpgsql;
@@ -1737,19 +1975,15 @@ create or replace function otra.fail_attempt_local (
 ) returns table (
   applied boolean, failed_permanently boolean, retry_at timestamptz
 ) as $$
-declare v_result record;
 begin
   perform 1 from otra.queues q where q.id = p_queue for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
-  begin
-    perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
-  exception when sqlstate 'OT001' or sqlstate 'OT002' then
-    return query select false, false, null::timestamptz; return;
-  end;
-  select * into v_result from otra._fail_attempt_local(
-    p_queue, p_root, p_execution, p_error, p_retryable
+  -- Ownership is verified inside _fail_attempt_local, under its ordered
+  -- locks (a separate assert-then-lock would acquire the child first and
+  -- break the global lock order).
+  return query select * from otra._fail_attempt_local(
+    p_queue, p_root, p_execution, p_error, p_retryable, p_worker
   );
-  return query select true, v_result.failed_permanently, v_result.retry_at;
 end;
 $$ language plpgsql;
 
@@ -1821,23 +2055,46 @@ declare
   v_p text := 'p_' || v_storage;
   v_now timestamptz := otra.now();
   v_row record;
+  v_tree uuid[];
+  v_parent uuid;
   v_has_history boolean;
   v_name text;
 begin
   perform 1 from otra.queues q where q.id = p_queue for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
-  for v_row in execute format(
+  -- Snapshot the tree membership unlocked, then take ONE lock statement in
+  -- the global ascending-id order: the target's parent (finalizing the
+  -- target settles promise rows there and wakes it) plus every non-terminal
+  -- member.  Terminal members are never locked -- they only produce 'noop'
+  -- rows -- which keeps the walk out of cleanup_local's way entirely.
+  execute format(
     'with recursive tree as (
        select id from otra.%1$I where root_id = $1 and id = $2
        union all
        select c.id from otra.%1$I c join tree t on c.parent_id = t.id
         where c.root_id = $1 and $3 and c.on_parent_cancel = ''cascade''
-     )
-     select e.id, e.status from otra.%1$I e
-      where e.root_id = $1 and e.id in (select id from tree)
-      order by e.id for update',
+     ) select array_agg(id) from tree',
     v_x
-  ) using p_root, p_execution, p_cascade loop
+  ) into v_tree using p_root, p_execution, p_cascade;
+  if v_tree is null then return; end if;
+  execute format(
+    'select parent_id from otra.%I where root_id = $1 and id = $2',
+    v_x
+  ) into v_parent using p_root, p_execution;
+  execute format(
+    'select 1 from otra.%I
+      where root_id = $1
+        and (id = $3 or (id = any ($2)
+             and status not in (''completed'', ''failed'', ''cancelled'')))
+      order by id for update',
+    v_x
+  ) using p_root, v_tree, v_parent;
+  for v_row in execute format(
+    'select e.id, e.status from otra.%I e
+      where e.root_id = $1 and e.id = any ($2)
+      order by e.id',
+    v_x
+  ) using p_root, v_tree loop
     if v_row.status in ('completed', 'failed', 'cancelled') then
       execution_id := v_row.id; action := 'noop'; return next; continue;
     end if;
@@ -1901,22 +2158,43 @@ declare
   v_x text := 'x_' || replace(p_queue::text, '-', '');
   v_now timestamptz := otra.now();
   v_row record;
+  v_tree uuid[];
+  v_parent uuid;
   v_count int := 0;
 begin
   perform 1 from otra.queues q where q.id = p_queue for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
-  for v_row in execute format(
+  -- Same lock discipline as request_cancel_local: snapshot membership, then
+  -- one ascending-id lock statement over the target's parent plus the
+  -- non-terminal members.
+  execute format(
     'with recursive tree as (
        select id from otra.%1$I where root_id = $1 and id = $2
        union all
        select c.id from otra.%1$I c join tree t on c.parent_id = t.id
         where c.root_id = $1 and $3 and c.on_parent_cancel = ''cascade''
-     )
-     select e.id, e.status from otra.%1$I e
-      where e.root_id = $1 and e.id in (select id from tree)
-      order by e.id for update',
+     ) select array_agg(id) from tree',
     v_x
-  ) using p_root, p_execution, p_cascade loop
+  ) into v_tree using p_root, p_execution, p_cascade;
+  if v_tree is null then return 0; end if;
+  execute format(
+    'select parent_id from otra.%I where root_id = $1 and id = $2',
+    v_x
+  ) into v_parent using p_root, p_execution;
+  execute format(
+    'select 1 from otra.%I
+      where root_id = $1
+        and (id = $3 or (id = any ($2)
+             and status not in (''completed'', ''failed'', ''cancelled'')))
+      order by id for update',
+    v_x
+  ) using p_root, v_tree, v_parent;
+  for v_row in execute format(
+    'select e.id, e.status from otra.%I e
+      where e.root_id = $1 and e.id = any ($2)
+      order by e.id',
+    v_x
+  ) using p_root, v_tree loop
     if v_row.status in ('completed', 'failed', 'cancelled') then continue; end if;
     execute format(
       'update otra.%I
@@ -1950,6 +2228,7 @@ declare
 begin
   perform 1 from otra.queues q where q.id = p_queue for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
     'update otra.%I
         set status = ''cancelled'', claim_expires_at = null,
@@ -1981,6 +2260,7 @@ declare
   v_limit int;
   v_storage text;
   v_x text;
+  v_p text;
   v_e text;
   v_i text;
   v_roots uuid[];
@@ -1992,6 +2272,7 @@ begin
   if not found then raise exception 'Queue "%" does not exist', p_queue; end if;
   v_storage := replace(v_queue_id::text, '-', '');
   v_x := 'x_' || v_storage;
+  v_p := 'p_' || v_storage;
   v_e := 'e_' || v_storage;
   v_i := 'i_' || v_storage;
   execute format(
@@ -2010,14 +2291,27 @@ begin
     v_x
   ) into v_roots using v_ttl, v_limit;
   if v_roots is not null then
+    -- Take every row of the candidate trees in the global ascending order
+    -- BEFORE deleting: the deletes below then only re-take held locks, so
+    -- cleanup cannot ABBA against walkers or terminal transitions.  (All
+    -- members are terminal -- walkers don't lock terminal rows -- so this
+    -- only ever contends with another cleanup.)
+    execute format(
+      'select 1 from otra.%I where root_id = any ($1)
+        order by root_id, id for update',
+      v_x
+    ) using v_roots;
     if v_mode = 'partitioned' then
       execute format('delete from otra.%I where root_id = any ($1)', v_i)
         using v_roots;
     end if;
-    execute format(
-      'delete from otra.%I where root_id = id and id = any ($1)',
-      v_x
-    ) using v_roots;
+    -- Promise rows first: resolvers lock promise -> execution, and deleting
+    -- the execution rows first would cascade into promise rows in the
+    -- opposite order.
+    execute format('delete from otra.%I where root_id = any ($1)', v_p)
+      using v_roots;
+    execute format('delete from otra.%I where root_id = any ($1)', v_x)
+      using v_roots;
   end if;
   execute format(
     'delete from otra.%1$I where id in (

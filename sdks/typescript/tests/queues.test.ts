@@ -404,8 +404,14 @@ test("discovers old empty partitions eligible for detach", async () => {
   const candidates = await app.listDetachCandidates("archive");
 
   assert.equal(candidates.length, 10);
-  assert.equal(candidates.every((candidate) => !candidate.partitionTable.endsWith("_d")), true);
-  assert.deepEqual(new Set(candidates.map((candidate) => candidate.queueName)), new Set(["archive"]));
+  assert.equal(
+    candidates.every((candidate) => !candidate.partitionTable.endsWith("_d")),
+    true,
+  );
+  assert.deepEqual(
+    new Set(candidates.map((candidate) => candidate.queueName)),
+    new Set(["archive"]),
+  );
 });
 
 test("keeps a promise generation attached while its execution generation is live", async () => {
@@ -510,5 +516,124 @@ test("queue tables enforce root ownership and cascade complete trees", async () 
          (select count(*)::int from otra."${promises}") as promises`,
     );
     assert.deepEqual(remaining.rows[0], { executions: 1, promises: 0 });
+  }
+});
+
+// --- partition maintenance hardening ----------------------------------------
+
+test("rows stranded in the default partition are drained when their week partition arrives", async () => {
+  const { app, pool } = env;
+  await app.createQueue("orders", { storageMode: "partitioned" });
+
+  // Maintenance lapses: jump far past the 28-day lookahead, so a new root
+  // has no week partition and lands in the default partition.
+  await env.setNow("2026-04-01T12:00:00Z");
+  app.task("late", function* () {
+    return "ok";
+  });
+  const execution = await app.spawn("late", null);
+
+  const { rows: q } = await pool.query(
+    "select replace(id::text, '-', '') as s from otra.queues where name = 'orders'",
+  );
+  const x = `x_${q[0].s}`;
+  const inDefault = await pool.query(
+    `select tableoid::regclass::text as rel from otra.${x} where id = $1`,
+    [execution.executionId],
+  );
+  assert.equal(inDefault.rows[0].rel, `otra.${x}_d`);
+
+  // The old code raised "updated partition constraint for default partition
+  // ... would be violated" here, permanently: the queue was wedged.
+  await app.ensurePartitions("orders");
+
+  // The row moved into its proper week partition and still runs.
+  const after = await pool.query(
+    `select tableoid::regclass::text as rel from otra.${x} where id = $1`,
+    [execution.executionId],
+  );
+  assert.notEqual(after.rows[0].rel, `otra.${x}_d`);
+  assert.match(after.rows[0].rel, /_\d{6}$/);
+
+  const worker = app.createWorker({ workerId: "w1", queue: "orders" });
+  await worker.drain();
+  assert.equal((await app.getExecution(execution))!.status, "completed");
+});
+
+test("draining the default partition preserves promise history and children", async () => {
+  const { app, pool } = env;
+  await app.createQueue("orders", { storageMode: "partitioned" });
+  await env.setNow("2026-04-01T12:00:00Z");
+
+  const child = app.task("drain-child", function* () {
+    return "child-done";
+  });
+  app.task("drain-parent", function* (_params: null, ctx) {
+    yield* ctx.run("step", () => 41);
+    const result = yield* ctx.call(child, null);
+    return result;
+  });
+  const execution = await app.spawn("drain-parent", null);
+  const worker = app.createWorker({ workerId: "w1", queue: "orders" });
+  await worker.drain(); // parent checkpoints, spawns child, child completes
+
+  const before = (await app.getExecution(execution))!;
+  assert.equal(before.status, "completed");
+
+  await app.ensurePartitions("orders"); // must move the whole tree intact
+
+  const { rows: q } = await pool.query(
+    "select replace(id::text, '-', '') as s from otra.queues where name = 'orders'",
+  );
+  const counts = await pool.query(
+    `select
+       (select count(*)::int from otra.x_${q[0].s} where root_id = $1) as executions,
+       (select count(*)::int from otra.p_${q[0].s} where root_id = $1) as promises,
+       (select count(*)::int from otra.x_${q[0].s}_d) as x_default,
+       (select count(*)::int from otra.p_${q[0].s}_d) as p_default`,
+    [execution.rootId],
+  );
+  // Parent + child executions; step + child promise rows; default emptied.
+  assert.equal(counts.rows[0].executions, 2);
+  assert.equal(counts.rows[0].promises, 2);
+  assert.equal(counts.rows[0].x_default, 0);
+  assert.equal(counts.rows[0].p_default, 0);
+});
+
+test("week stepping is DST-proof: partition bounds are contiguous across spring-forward", async () => {
+  const { app, pool, connectionString } = env;
+  const client = new pg.Client({ connectionString });
+  await client.connect();
+  try {
+    await client.query("set time zone 'America/New_York'");
+    // US DST starts 2026-03-08; the 28-day lookahead spans it.
+    await client.query("select otra.set_fake_now('2026-02-25T12:00:00Z')");
+    await client.query("select otra.create_queue('dst', 'partitioned')");
+
+    const { rows } = await client.query(`
+      select c.relname,
+             pg_get_expr(c.relpartbound, c.oid) as bound
+        from pg_inherits i
+        join pg_class c on c.oid = i.inhrelid
+        join pg_class p on p.oid = i.inhparent
+        join otra.queues q on p.relname = 'x_' || replace(q.id::text, '-', '')
+       where q.name = 'dst' and pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+       order by c.relname`);
+    assert.ok(rows.length >= 4, `expected a full window, got ${rows.length}`);
+    const bounds = rows.map((r: { bound: string }) => {
+      const m = /FROM \('([0-9a-f-]+)'\) TO \('([0-9a-f-]+)'\)/.exec(r.bound);
+      assert.ok(m, `unparsable bound: ${r.bound}`);
+      return { from: m![1]!, to: m![2]! };
+    });
+    for (let i = 1; i < bounds.length; i++) {
+      // The old session-timezone arithmetic left a 7-day hole here.
+      assert.equal(
+        bounds[i]!.from,
+        bounds[i - 1]!.to,
+        `gap between partitions ${i - 1} and ${i}`,
+      );
+    }
+  } finally {
+    await client.end();
   }
 });

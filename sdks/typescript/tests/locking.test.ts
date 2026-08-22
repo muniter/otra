@@ -146,3 +146,50 @@ test("resolve-then-suspend: a parent parking against a completed child refuses t
   assert.equal(parked[0].suspended, false);
   assert.equal((await env.app.getExecution(parent))!.status, "running");
 });
+
+test("tree cancellation and child completion share one lock order (no ABBA deadlock)", async () => {
+  const { parent, child } = await parentAndChild();
+  // The deterministic global lock order is ascending (root_id, id). Under
+  // the frozen test clock both uuid_v7 ids share a millisecond, so which
+  // row sorts first is random -- derive it, as the engine must.
+  const [first, second] =
+    parent.executionId < child.executionId
+      ? [parent.executionId, child.executionId]
+      : [child.executionId, parent.executionId];
+  const x = `x_${parent.queueId.replaceAll("-", "")}`;
+
+  // A plays a cancel walk that has acquired the first row and not the rest.
+  await a.query("begin");
+  await a.query(
+    `select 1 from otra.${x} where root_id = $1 and id = $2 for update`,
+    [parent.rootId, first],
+  );
+
+  // B completes the child. Under the unified order it must acquire the
+  // pair's FIRST lock first -- so it blocks immediately, holding nothing.
+  const completing = b.query(
+    "select otra.complete_local($1, $2, $3, 'w2', '\"r\"'::jsonb)",
+    [child.queueId, child.rootId, child.executionId],
+  );
+  await waitUntilBlockedOnLock(bPid);
+
+  // The old order let B hold one row while blocking on the other; A then
+  // locking B's held row deadlocked. Now A must acquire the second row
+  // instantly while B waits empty-handed.
+  await a.query("set local statement_timeout = '2s'");
+  await a.query(
+    `select 1 from otra.${x} where root_id = $1 and id = $2 for update`,
+    [parent.rootId, second],
+  );
+
+  await a.query("commit");
+  await completing;
+
+  assert.equal((await env.app.getExecution(child))!.status, "completed");
+  const { rows } = await env.pool.query(
+    `select status from otra.p_${parent.queueId.replaceAll("-", "")}
+      where root_id = $1 and execution_id = $2 and key = 'child-key'`,
+    [parent.rootId, parent.executionId],
+  );
+  assert.equal(rows[0].status, "resolved");
+});

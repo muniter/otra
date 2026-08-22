@@ -116,9 +116,22 @@ export class Otra {
     return this.db.listQueues();
   }
 
-  /** Extend partition windows for one queue, or every partitioned queue. */
+  /**
+   * Extend partition windows for one queue, or every partitioned queue.
+   * The multi-queue form runs one transaction per queue: a single
+   * transaction would hold every queue's maintenance barrier at once,
+   * blocking spawn/claim on queues whose DDL isn't even being touched.
+   */
   async ensurePartitions(name?: string): Promise<void> {
-    await this.db.ensurePartitions(name);
+    if (name !== undefined) {
+      await this.db.ensurePartitions(name);
+      return;
+    }
+    for (const queue of await this.listQueues()) {
+      if (queue.storageMode === "partitioned") {
+        await this.db.ensurePartitions(queue.name);
+      }
+    }
   }
 
   /** Update retention and partition lifecycle policy for a queue. */
