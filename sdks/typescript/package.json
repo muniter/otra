@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "description": "Generator-based durable execution on Postgres, built on durable promises. From the top.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muniter/otra.git"
+  },
+  "keywords": [
+    "durable-execution",
+    "durable-promises",
+    "postgres",
+    "workflow",
+    "generators",
+    "task-queue",
+    "saga",
+    "orchestration"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

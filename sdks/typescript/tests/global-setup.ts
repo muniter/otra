@@ -36,6 +36,20 @@ export async function globalSetup(): Promise<void> {
     await template.end();
   }
 
+  // Lock the template down the way template0 is: with connections barred,
+  // autovacuum skips it and nothing can hold it open, so `create database
+  // ... template otra_template` never trips over "source database is being
+  // accessed by other users". Cloning is unaffected -- the template read
+  // path does not open a normal connection (verified against PG 16).
+  const lockdown = new pg.Pool({ connectionString: adminUrl });
+  try {
+    await lockdown.query(
+      `alter database ${TEMPLATE_DATABASE} with allow_connections false`,
+    );
+  } finally {
+    await lockdown.end();
+  }
+
   process.env.OTRA_TEST_ADMIN_DB = adminUrl;
   process.env.OTRA_TEST_TEMPLATE_DB = TEMPLATE_DATABASE;
 }

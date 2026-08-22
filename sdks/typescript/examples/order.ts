@@ -74,6 +74,11 @@ const orderFulfillment = app.task(
   },
 );
 
+// Queues are provisioned explicitly (this one owns its own storage); spawning
+// onto a queue that does not exist yet fails with 'Queue "orders" does not
+// exist'.  createQueue is idempotent, so it is safe on every boot.
+await app.createQueue();
+
 const execution = await app.spawn(orderFulfillment, {
   orderId: "42",
   amount: 9_999,

@@ -6,24 +6,32 @@ import { Otra } from "../src/index.ts";
 
 /**
  * The global test setup prepares a template in a Postgres Testcontainer;
- * each test clones an isolated database from it. Point OTRA_TEST_DB at an
- * existing database to use serial schema resets instead, e.g.:
+ * each test clones an isolated database from it and drops it on close().
+ * Point OTRA_TEST_DB at an existing database to use serial schema resets
+ * instead, e.g.:
  *   OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres make test
+ *
+ * There is deliberately NO default DSN: without one of the two modes
+ * configured, eight-wide test files would silently share one database and
+ * fail incomprehensibly instead of naming the real problem.
  */
-const SHARED_DSN =
-  process.env.OTRA_TEST_DB ?? "postgres://postgres@127.0.0.1:5433/postgres";
-
 function databaseUrl(connectionString: string, database: string): string {
   const url = new URL(connectionString);
   url.pathname = `/${database}`;
   return url.href;
 }
 
-async function isolatedDatabaseUrl(): Promise<string | undefined> {
-  const adminUrl = process.env.OTRA_TEST_ADMIN_DB;
-  const template = process.env.OTRA_TEST_TEMPLATE_DB;
-  if (!adminUrl || !template) return undefined;
+/** An isolated clone of the template database, plus how to drop it again. */
+interface IsolatedDatabase {
+  connectionString: string;
+  adminUrl: string;
+  database: string;
+}
 
+async function createIsolatedDatabase(
+  adminUrl: string,
+  template: string,
+): Promise<IsolatedDatabase> {
   const database = `otra_test_${randomUUID().replaceAll("-", "")}`;
   const admin = new pg.Client({ connectionString: adminUrl });
   await admin.connect();
@@ -32,7 +40,72 @@ async function isolatedDatabaseUrl(): Promise<string | undefined> {
   } finally {
     await admin.end();
   }
-  return databaseUrl(adminUrl, database);
+  return {
+    connectionString: databaseUrl(adminUrl, database),
+    adminUrl,
+    database,
+  };
+}
+
+/** Postgres: "source/target database is being accessed by other users". */
+function isDatabaseInUse(error: unknown): boolean {
+  return (error as { code?: string } | null)?.code === "55006";
+}
+
+/**
+ * Give the cloned database back; otherwise a run leaks one database per test
+ * (~85 per suite, hundreds of MB).
+ *
+ * The drop is deliberately NOT `with (force)` on the first attempts: a
+ * backend whose client just called end() lingers in pg_stat_activity for a
+ * few milliseconds, and force-dropping SIGTERMs it -- the FATAL reaches the
+ * dying socket and surfaces in the test process as an unhandled 'error'
+ * after the test has ended ("terminating connection due to administrator
+ * command"), failing whole files. So wait the stragglers out, and force only
+ * as a last resort, when a genuinely leaked connection is holding the
+ * database open.
+ */
+async function dropIsolatedDatabase(isolated: IsolatedDatabase): Promise<void> {
+  const admin = new pg.Client({ connectionString: isolated.adminUrl });
+  await admin.connect();
+  try {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await admin.query(`drop database if exists "${isolated.database}"`);
+        return;
+      } catch (error) {
+        if (!isDatabaseInUse(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    await admin.query(
+      `drop database if exists "${isolated.database}" with (force)`,
+    );
+  } finally {
+    await admin.end();
+  }
+}
+
+/** Resolve the database this test runs against, or say why we cannot. */
+async function resolveDatabase(): Promise<{
+  connectionString: string;
+  /** Set only in isolated-clone mode: the clone close() must drop. */
+  isolated?: IsolatedDatabase;
+}> {
+  const adminUrl = process.env.OTRA_TEST_ADMIN_DB;
+  const template = process.env.OTRA_TEST_TEMPLATE_DB;
+  if (adminUrl && template) {
+    const isolated = await createIsolatedDatabase(adminUrl, template);
+    return { connectionString: isolated.connectionString, isolated };
+  }
+  const shared = process.env.OTRA_TEST_DB;
+  if (shared) return { connectionString: shared };
+  throw new Error(
+    "test global setup did not run and OTRA_TEST_DB is not set: run the " +
+      "suite with `npm test` (Node >= 24, Docker for the Testcontainer) or " +
+      "point OTRA_TEST_DB at an existing Postgres, e.g. " +
+      "OTRA_TEST_DB=postgres://postgres@127.0.0.1:5433/postgres npm test",
+  );
 }
 
 export interface TestEnv {
@@ -67,11 +140,10 @@ export async function createTestEnv(
   queue = "default",
   provisionQueue = true,
 ): Promise<TestEnv> {
-  const isolatedUrl = await isolatedDatabaseUrl();
-  const connectionString = isolatedUrl ?? SHARED_DSN;
+  const { connectionString, isolated } = await resolveDatabase();
   const pool = new pg.Pool({ connectionString, max: 4 });
   const app = new Otra({ db: pool, queue });
-  if (!isolatedUrl) {
+  if (!isolated) {
     await pool.query("drop schema if exists otra cascade");
     await app.applySchema();
   }
@@ -94,6 +166,8 @@ export async function createTestEnv(
     },
     async close() {
       await pool.end();
+      // Shared-DSN mode owns its database; only clones are ours to drop.
+      if (isolated) await dropIsolatedDatabase(isolated);
     },
   };
 }

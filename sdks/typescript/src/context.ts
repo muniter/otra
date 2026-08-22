@@ -5,6 +5,7 @@ import {
   type DurableHandle,
   type Effect,
   type ExternalPromise,
+  type JsonConstraint,
   type JsonValue,
   type Op,
   type TaskHandle,
@@ -48,9 +49,17 @@ function* op<T>(effect: Effect): Op<T> {
 type RunResult<T> = [Awaited<T>] extends [void] ? null : Awaited<T>;
 type RunReturnConstraint<T> = [Awaited<T>] extends [void]
   ? unknown
-  : Awaited<T> extends JsonValue
-    ? unknown
-    : never;
+  : JsonConstraint<Awaited<T>>;
+
+/**
+ * The name/label string of a method whose *explicit* type argument decides
+ * what gets read back out of the journal (`waitForEvent<T>`, `promise<T>`).
+ * There is no value argument of type `T` to hang the JSON check on, and a
+ * `T extends JsonCompatible<T>` type-parameter constraint is rejected by
+ * TypeScript as circular -- so the check rides on the string argument, which
+ * puts the error (and its reason) on the offending call itself.
+ */
+type JsonLabel<T> = string & JsonConstraint<T>;
 
 /**
  * The durable context passed to every task handler.  All methods return
@@ -146,7 +155,7 @@ export class Ctx {
    * With a timeout, an `EventTimeoutError` is thrown into the task instead.
    */
   waitForEvent<T = JsonValue>(
-    eventName: string,
+    eventName: JsonLabel<T>,
     options: { timeout?: number | string; label?: string } = {},
   ): Op<T> {
     return op({
@@ -192,7 +201,7 @@ export class Ctx {
    * catchable `TimeoutError` instead of waiting forever.
    */
   promise<T = JsonValue>(
-    label = "$promise",
+    label: JsonLabel<T> = "$promise" as JsonLabel<T>,
     options: { timeout?: number | string } = {},
   ): Op<ExternalPromise<T>> {
     return op({

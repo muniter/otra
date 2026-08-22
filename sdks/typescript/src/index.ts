@@ -2,7 +2,9 @@ export { Otra } from "./app.ts";
 export type {
   OtraOptions,
   GetResultOptions,
+  CleanupOptions,
   CreateQueueOptions,
+  DropQueueOptions,
 } from "./app.ts";
 export { Ctx, parseDuration } from "./context.ts";
 export type { HandleResults } from "./context.ts";
@@ -50,7 +52,10 @@ export type {
   ExecutionRef,
   ExecutionSnapshot,
   ExecutionStatus,
+  JsonCompatible,
+  JsonConstraint,
   JsonValue,
+  NotJsonSerializable,
   Op,
   RegisteredTask,
   RetryStrategy,

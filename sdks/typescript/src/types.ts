@@ -12,13 +12,71 @@
  * sentinel exception that user `catch` blocks can accidentally swallow.
  */
 
+// Type-only, so it is erased at runtime and creates no import cycle with
+// context.ts (which imports this module for real).
+import type { Ctx } from "./context.ts";
+
 export type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+  string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/**
+ * The shape a value degrades to when it cannot survive a JSON round trip.
+ * It exists only to put a readable reason into the type error: an offending
+ * value is reported as not assignable to
+ * `NotJsonSerializable<"a Date deserializes as a string; ...">` instead of
+ * the opaque `not assignable to type 'never'`.
+ */
+export interface NotJsonSerializable<Reason extends string = string> {
+  readonly __otraNotJsonSerializable: Reason;
+}
+
+/**
+ * Structural test that `T` survives the JSON round trip Postgres imposes on
+ * every persisted value (task params and results, `ctx.run` checkpoints,
+ * event payloads, externally-settled promises).
+ *
+ * `T extends JsonValue` alone is not usable as that test: TypeScript grants
+ * an implicit index signature to *type aliases* only, so every `interface`
+ * fails it -- the very shape most codebases are written in.  Recursing
+ * structurally accepts interfaces, optional properties and arrays of them,
+ * while still rejecting values whose shape changes on the way back
+ * (`Date` -> string, `Map`/`Set` -> `{}`, functions and symbols -> gone,
+ * `bigint` -> a thrown TypeError).
+ *
+ * `undefined` and `void` are allowed on purpose: they persist as null, which
+ * is the established runtime behavior.
+ */
+export type JsonCompatible<T> = unknown extends T
+  ? T // `any` / `unknown`: nothing to check against
+  : T extends JsonValue
+    ? T
+    : T extends undefined | void
+      ? T
+      : T extends readonly (infer Element)[]
+        ? readonly JsonCompatible<Element>[]
+        : T extends Date
+          ? NotJsonSerializable<"a Date deserializes as a string; persist an ISO string or epoch millis">
+          : T extends Map<unknown, unknown> | Set<unknown>
+            ? NotJsonSerializable<"a Map/Set serializes to {}; persist an array or a plain object">
+            : T extends (...args: never[]) => unknown
+              ? NotJsonSerializable<"a function cannot be persisted">
+              : T extends symbol
+                ? NotJsonSerializable<"a symbol cannot be persisted">
+                : T extends bigint
+                  ? NotJsonSerializable<"a bigint throws in JSON.stringify; persist a string or a number">
+                  : T extends object
+                    ? { [K in keyof T]: JsonCompatible<T[K]> }
+                    : NotJsonSerializable<"this value cannot be persisted as JSON">;
+
+/**
+ * `unknown` -- the identity for intersection -- when `T` round-trips through
+ * JSON, otherwise the degraded shape.  Intersecting it with `T` in a
+ * signature therefore costs nothing for good values and turns a bad one into
+ * an error naming the offending property and the reason it is rejected.
+ */
+export type JsonConstraint<T> = [T] extends [JsonCompatible<T>]
+  ? unknown
+  : JsonCompatible<T>;
 
 /** Serialized error payload stored in Postgres. */
 export interface ErrorPayload {
@@ -172,11 +230,23 @@ export type Effect =
 /** The generator type produced by every `ctx.*` method. */
 export type Op<T> = Generator<Effect, T, unknown>;
 
-/** A durable function body. */
+/**
+ * A durable function body.
+ *
+ * Params are written to Postgres as JSON at spawn time and results are read
+ * back from it by whoever awaits them, so both must survive that round trip.
+ * The result is checked in its natural (covariant) position.  The params
+ * check deliberately rides on the return type instead: a parameter position
+ * is contravariant, so intersecting the constraint there would accept every
+ * bad type (`{ when: Date & NotJsonSerializable }` is still assignable to
+ * `{ when: Date }`).  `NoInfer` keeps that second occurrence of `P` out of
+ * inference, so `P` is still read off the params argument alone.
+ */
 export type TaskHandler<P, R> = (
   params: P,
-  ctx: import("./context.ts").Ctx,
-) => Generator<Effect, R, unknown>;
+  ctx: Ctx,
+) => Generator<Effect, R & JsonConstraint<R>, unknown> &
+  JsonConstraint<NoInfer<P>>;
 
 export interface TaskOptions {
   name: string;
@@ -188,7 +258,13 @@ export interface RegisteredTask {
   name: string;
   maxAttempts?: number;
   retryStrategy?: RetryStrategy;
-  handler: TaskHandler<never, unknown>;
+  /**
+   * The erased handler the driver calls.  Params and results were checked
+   * against `JsonCompatible` at registration; the registry itself is
+   * untyped, so it must not re-apply a constraint the driver cannot satisfy
+   * (it feeds in params decoded from the journal).
+   */
+  handler: (params: never, ctx: Ctx) => Generator<Effect, unknown, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,12 +272,7 @@ export interface RegisteredTask {
 // ---------------------------------------------------------------------------
 
 export type ExecutionStatus =
-  | "pending"
-  | "running"
-  | "suspended"
-  | "completed"
-  | "failed"
-  | "cancelled";
+  "pending" | "running" | "suspended" | "completed" | "failed" | "cancelled";
 
 export interface ExecutionSnapshot {
   id: string;

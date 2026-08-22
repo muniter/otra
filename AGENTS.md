@@ -37,10 +37,16 @@ systems, and the decisions already made so you don't relitigate them.
    any promise wakes a suspended owner; if it is still blocked, the replay
    re-parks. Cheap and race-free. The no-lost-wakeup guarantee rests on lock
    order: `suspend()` locks the execution row before checking blockers;
-   resolvers lock promise row first, execution row second; `_wake` locks
-   executions in id order. Proven under forced contention in
-   `sdks/typescript/tests/locking.test.ts` — extend those tests if you touch
-   lock order.
+   resolvers lock promise row first, execution row second. On top of that,
+   **every multi-row execution lock uses one global order: ascending
+   `(root_id, id)`** — `_wake_local`, the cancel/kill tree walks (which
+   never lock terminal rows), cleanup, and terminal transitions (which lock
+   self + parent via `_lock_terminal_scope` before writing; uuid_v7 ids in
+   the same millisecond are NOT parent-before-child, hence order-by-id, not
+   tree order). Cross-root loops (event emits, claim sweeps) visit roots in
+   `root_id` order. Proven under forced contention in
+   `sdks/typescript/tests/locking.test.ts` (including an ABBA regression) —
+   extend those tests if you touch lock order.
 6. **Ownership guards on every history write.** `_assert_owner` raises
    sqlstate `OT001` (claim lost/zombie) or `OT002` (killed) on
    `record_run`/`create_sleep`/`create_event_wait`/`create_external`/
@@ -61,14 +67,29 @@ systems, and the decisions already made so you don't relitigate them.
     for repeats; a key re-encountered with a different kind/label raises
     `DeterminismViolationError` (non-retryable). Labels starting with `$`
     are engine-reserved (`$sleep`, `$event:*`, `$spawn:*`, `$promise`,
-    `$cancel`).
+    `$cancel`) and `Ctx` REJECTS user-supplied `$`-labels — a user step
+    keyed `$cancel` would occupy the cancellation journal and make the
+    execution permanently un-cancellable.
+11. **Cancellation delivery never waits out a backoff** (`request_cancel`
+    expedites pending rows; a failing attempt with an undelivered cancel
+    retries immediately), **never splits a `ctx.uninterruptible` section**
+    (a shielded park is legal via `suspend_local(p_shielded)`; delivery
+    lands after the shield exits), and **a lost claim or kill() aborts
+    `ctx.signal` from the heartbeat** so well-behaved long steps unblock.
+12. **Partition maintenance must never wedge on the default partition.**
+    `ensure_partitions` drains stranded default-partition rows into the new
+    week partition (promises parked first so the execution move cannot
+    cascade history away) and steps weeks through `week_bucket_utc` — plain
+    `+ interval '7 days'` is session-time-zone arithmetic and skips a week
+    across DST. One queue's maintenance failure must not poison the rest.
 
 ## How this repo is developed
 
 - **TDD is the house rule.** Every behavior change lands as a failing test
   first; run it red, implement, run the full suite. Regression tests cite
   what motivated them (several cite absurd commits — keep that habit).
-- **Tests run against real Postgres.** `make test` starts a session-scoped
+- **Tests run against real Postgres, on Node >= 24** (the runner uses
+  `--test-global-setup`). `make test` starts a session-scoped
   Postgres 16 Testcontainer, applies the schema to a template database, and
   gives each test an isolated clone. Test files run eight-wide by default;
   `OTRA_TEST_CONCURRENCY` overrides the limit. Set
