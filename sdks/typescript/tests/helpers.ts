@@ -63,7 +63,10 @@ export async function waitFor(
   }
 }
 
-export async function createTestEnv(queue = "default"): Promise<TestEnv> {
+export async function createTestEnv(
+  queue = "default",
+  provisionQueue = true,
+): Promise<TestEnv> {
   const isolatedUrl = await isolatedDatabaseUrl();
   const connectionString = isolatedUrl ?? SHARED_DSN;
   const pool = new pg.Pool({ connectionString, max: 4 });
@@ -72,6 +75,7 @@ export async function createTestEnv(queue = "default"): Promise<TestEnv> {
     await pool.query("drop schema if exists otra cascade");
     await app.applySchema();
   }
+  if (provisionQueue) await app.createQueue();
   await pool.query("select otra.set_fake_now($1)", ["2026-01-01T00:00:00Z"]);
   return {
     app,

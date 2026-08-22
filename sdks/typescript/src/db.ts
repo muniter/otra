@@ -59,6 +59,36 @@ export interface ClaimedExecution {
   cancelRequested: boolean;
 }
 
+export interface Queue {
+  name: string;
+  storageMode: QueueStorageMode;
+}
+
+export type QueueStorageMode = "unpartitioned" | "partitioned";
+export type QueueDetachMode = "none" | "empty";
+
+export interface QueuePolicyOptions {
+  defaultPartition?: "enabled" | "disabled";
+  partitionLookahead?: string;
+  partitionLookback?: string;
+  cleanupTtl?: string;
+  cleanupLimit?: number;
+  detachMode?: QueueDetachMode;
+  detachMinAge?: string;
+}
+
+export interface QueuePolicy extends Required<QueuePolicyOptions> {
+  name: string;
+  storageMode: QueueStorageMode;
+  defaultPartition: "enabled" | "disabled";
+}
+
+export interface DetachCandidate {
+  queueName: string;
+  parentTable: string;
+  partitionTable: string;
+}
+
 function toJson(value: unknown): string {
   const encoded = JSON.stringify(value === undefined ? null : value);
   // JSON.stringify still returns undefined for bare functions/symbols.
@@ -103,6 +133,96 @@ export class Db {
 
   constructor(client: Queryable) {
     this.client = client;
+  }
+
+  async createQueue(
+    name: string,
+    storageMode: QueueStorageMode = "unpartitioned",
+  ): Promise<void> {
+    await this.client.query(`select otra.create_queue($1, $2)`, [
+      name,
+      storageMode,
+    ]);
+  }
+
+  async getQueue(name: string): Promise<Queue | null> {
+    const { rows } = await this.client.query(
+      `select name, storage_mode from otra.get_queue($1)`,
+      [name],
+    );
+    if (rows.length === 0) return null;
+    return { name: rows[0].name, storageMode: rows[0].storage_mode };
+  }
+
+  async listQueues(): Promise<Queue[]> {
+    const { rows } = await this.client.query(
+      `select name, storage_mode from otra.list_queues()`,
+    );
+    return rows.map((row: Record<string, unknown>) => ({
+      name: row.name as string,
+      storageMode: row.storage_mode as Queue["storageMode"],
+    }));
+  }
+
+  async ensurePartitions(name?: string): Promise<void> {
+    await this.client.query(`select otra.ensure_partitions($1)`, [name ?? null]);
+  }
+
+  async setQueuePolicy(name: string, options: QueuePolicyOptions): Promise<void> {
+    const policy: Record<string, unknown> = {};
+    if (options.defaultPartition !== undefined)
+      policy.default_partition = options.defaultPartition;
+    if (options.partitionLookahead !== undefined)
+      policy.partition_lookahead = options.partitionLookahead;
+    if (options.partitionLookback !== undefined)
+      policy.partition_lookback = options.partitionLookback;
+    if (options.cleanupTtl !== undefined) policy.cleanup_ttl = options.cleanupTtl;
+    if (options.cleanupLimit !== undefined)
+      policy.cleanup_limit = options.cleanupLimit;
+    if (options.detachMode !== undefined) policy.detach_mode = options.detachMode;
+    if (options.detachMinAge !== undefined)
+      policy.detach_min_age = options.detachMinAge;
+    await this.client.query(`select otra.set_queue_policy($1, $2::jsonb)`, [
+      name,
+      JSON.stringify(policy),
+    ]);
+  }
+
+  async getQueuePolicy(name: string): Promise<QueuePolicy | null> {
+    const { rows } = await this.client.query(
+      `select name, storage_mode, default_partition,
+              partition_lookahead::text, partition_lookback::text,
+              cleanup_ttl::text, cleanup_limit, detach_mode,
+              detach_min_age::text
+         from otra.get_queue_policy($1)`,
+      [name],
+    );
+    if (rows.length === 0) return null;
+    const row = rows[0];
+    return {
+      name: row.name,
+      storageMode: row.storage_mode,
+      defaultPartition: row.default_partition,
+      partitionLookahead: row.partition_lookahead,
+      partitionLookback: row.partition_lookback,
+      cleanupTtl: row.cleanup_ttl,
+      cleanupLimit: row.cleanup_limit,
+      detachMode: row.detach_mode,
+      detachMinAge: row.detach_min_age,
+    };
+  }
+
+  async listDetachCandidates(name?: string): Promise<DetachCandidate[]> {
+    const { rows } = await this.client.query(
+      `select queue_name, parent_table, partition_table
+         from otra.list_detach_candidates($1)`,
+      [name ?? null],
+    );
+    return rows.map((row: Record<string, unknown>) => ({
+      queueName: row.queue_name as string,
+      parentTable: row.parent_table as string,
+      partitionTable: row.partition_table as string,
+    }));
   }
 
   async spawn(

@@ -4,7 +4,15 @@ import { fileURLToPath } from "node:url";
 
 import pg from "pg";
 
-import { Db, type Queryable } from "./db.ts";
+import {
+  Db,
+  type Queryable,
+  type DetachCandidate,
+  type Queue,
+  type QueuePolicy,
+  type QueuePolicyOptions,
+  type QueueStorageMode,
+} from "./db.ts";
 import { Worker, type WorkerOptions } from "./worker.ts";
 import {
   ExecutionFailedError,
@@ -28,6 +36,10 @@ export interface GetResultOptions {
   timeoutMs?: number;
   /** Poll interval in milliseconds (default 25ms). */
   pollMs?: number;
+}
+
+export interface CreateQueueOptions {
+  storageMode?: QueueStorageMode;
 }
 
 function isPool(db: unknown): db is pg.Pool {
@@ -84,6 +96,47 @@ export class Otra {
       handler: handler as RegisteredTask["handler"],
     });
     return { name: options.name };
+  }
+
+  /** Provision a queue, defaulting to this app's queue. */
+  async createQueue(
+    name = this.queue,
+    options: CreateQueueOptions = {},
+  ): Promise<void> {
+    await this.db.createQueue(name, options.storageMode);
+  }
+
+  /** Return a provisioned queue, or null when it does not exist. */
+  async getQueue(name = this.queue): Promise<Queue | null> {
+    return this.db.getQueue(name);
+  }
+
+  /** List every provisioned queue in name order. */
+  async listQueues(): Promise<Queue[]> {
+    return this.db.listQueues();
+  }
+
+  /** Extend partition windows for one queue, or every partitioned queue. */
+  async ensurePartitions(name?: string): Promise<void> {
+    await this.db.ensurePartitions(name);
+  }
+
+  /** Update retention and partition lifecycle policy for a queue. */
+  async setQueuePolicy(
+    name: string,
+    options: QueuePolicyOptions,
+  ): Promise<void> {
+    await this.db.setQueuePolicy(name, options);
+  }
+
+  /** Return the complete storage policy for a provisioned queue. */
+  async getQueuePolicy(name = this.queue): Promise<QueuePolicy | null> {
+    return this.db.getQueuePolicy(name);
+  }
+
+  /** List old empty partitions eligible for an operator-managed detach. */
+  async listDetachCandidates(name?: string): Promise<DetachCandidate[]> {
+    return this.db.listDetachCandidates(name);
   }
 
   /** Spawn a top-level execution; returns its id immediately. */

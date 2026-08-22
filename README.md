@@ -92,6 +92,7 @@ replayed as an event wait, say) is detected and fails the execution with a
 import { Otra } from "otra";
 
 const app = new Otra({ db: process.env.DATABASE_URL, queue: "orders" });
+await app.createQueue();
 
 const processPayment = app.task("process-payment", function* (params: { amount: number }, ctx) {
   return yield* ctx.run("charge", async () => {
@@ -167,6 +168,9 @@ through:
 `app.emitEvent(name, payload?)`, `app.resolvePromise(token, value)` /
 `app.rejectPromise(token, error)`, `app.getResult(id)`,
 `app.getExecution(id)`, `app.cancel(id)`, `app.kill(id)`,
+`app.createQueue(name?)`, `app.getQueue(name?)`, `app.listQueues()`,
+`app.setQueuePolicy(name, policy)`, `app.getQueuePolicy(name?)`,
+`app.ensurePartitions(name?)`, `app.listDetachCandidates(name?)`,
 `app.createWorker()` / `app.startWorker()`, `app.applySchema()`.
 
 Top-level spawns accept an `idempotencyKey` (at-most-one execution per

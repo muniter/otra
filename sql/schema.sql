@@ -56,28 +56,134 @@ create or replace function otra.clear_fake_now () returns void as $$
   delete from otra.config where key = 'fake_now';
 $$ language sql;
 
--- UUIDv7 (time ordered).  Postgres 18 ships uuidv7(); this is the standard
--- fallback construction for older versions.
+-- UUIDv7 (time ordered), generated against otra.now() so partition routing and
+-- deterministic tests use the same clock on every supported PostgreSQL.
 create or replace function otra.uuid_v7 () returns uuid as $$
-  select encode(
-    set_bit(
-      set_bit(
-        overlay(
-          uuid_send(gen_random_uuid())
-          placing substring(int8send((extract(epoch from clock_timestamp()) * 1000)::bigint) from 3)
-          from 1 for 6
-        ),
-        52, 1
-      ),
-      53, 1
-    ),
-    'hex'
-  )::uuid;
-$$ language sql volatile;
+declare
+  v_ts_ms bigint := floor(extract(epoch from otra.now()) * 1000)::bigint;
+  v_bytes bytea := repeat(E'\\000', 16)::bytea;
+  v_random bytea := uuid_send(gen_random_uuid());
+  i int;
+begin
+  if v_ts_ms < 0 or v_ts_ms > 281474976710655 then
+    raise exception 'Timestamp "%" is outside UUIDv7 supported range', otra.now();
+  end if;
+  for i in 0..5 loop
+    v_bytes := set_byte(v_bytes, i, ((v_ts_ms >> ((5 - i) * 8)) & 255)::int);
+  end loop;
+  for i in 6..15 loop
+    v_bytes := set_byte(v_bytes, i, get_byte(v_random, i));
+  end loop;
+  v_bytes := set_byte(v_bytes, 6, ((get_byte(v_bytes, 6) & 15) | (7 << 4)));
+  v_bytes := set_byte(v_bytes, 8, ((get_byte(v_bytes, 8) & 63) | 128));
+  return encode(v_bytes, 'hex')::uuid;
+end;
+$$ language plpgsql volatile;
+
+create or replace function otra.uuid_v7_timestamp (p_id uuid) returns timestamptz as $$
+  with bytes as (
+    select uuid_send(p_id) as value
+  ), decoded as (
+    select
+      get_byte(value, 6) >> 4 as version,
+      ((get_byte(value, 0)::bigint << 40) |
+       (get_byte(value, 1)::bigint << 32) |
+       (get_byte(value, 2)::bigint << 24) |
+       (get_byte(value, 3)::bigint << 16) |
+       (get_byte(value, 4)::bigint << 8) |
+        get_byte(value, 5)::bigint) as timestamp_ms
+    from bytes
+  )
+  select case when version = 7
+    then 'epoch'::timestamptz + timestamp_ms * interval '1 millisecond'
+    else null
+  end
+  from decoded;
+$$ language sql immutable strict;
+
+create or replace function otra.uuid_v7_floor (p_time timestamptz) returns uuid as $$
+declare
+  v_ts_ms bigint := floor(extract(epoch from p_time) * 1000)::bigint;
+  v_bytes bytea := repeat(E'\\000', 16)::bytea;
+  i int;
+begin
+  if v_ts_ms < 0 or v_ts_ms > 281474976710655 then
+    raise exception 'Timestamp "%" is outside UUIDv7 supported range', p_time;
+  end if;
+  for i in 0..5 loop
+    v_bytes := set_byte(v_bytes, i, ((v_ts_ms >> ((5 - i) * 8)) & 255)::int);
+  end loop;
+  v_bytes := set_byte(v_bytes, 6, (7 << 4));
+  v_bytes := set_byte(v_bytes, 8, 128);
+  return encode(v_bytes, 'hex')::uuid;
+end;
+$$ language plpgsql immutable strict;
+
+create or replace function otra.week_bucket_utc (p_time timestamptz) returns timestamptz as $$
+  select date_trunc('week', p_time at time zone 'UTC') at time zone 'UTC';
+$$ language sql immutable strict;
+
+create or replace function otra.partition_week_tag (p_time timestamptz) returns text as $$
+  select to_char(otra.week_bucket_utc(p_time) at time zone 'UTC', 'IYYYIW');
+$$ language sql immutable strict;
 
 ------------------------------------------------------------------------------
 -- tables
 ------------------------------------------------------------------------------
+
+create table if not exists otra.queues (
+  id           uuid primary key default otra.uuid_v7(),
+  name         text not null unique,
+  storage_mode text not null default 'unpartitioned',
+  default_partition text not null default 'enabled',
+  partition_lookahead interval not null default interval '28 days',
+  partition_lookback interval not null default interval '1 day',
+  cleanup_ttl interval not null default interval '30 days',
+  cleanup_limit int not null default 1000,
+  detach_mode text not null default 'none',
+  detach_min_age interval not null default interval '30 days',
+  created_at   timestamptz not null default otra.now(),
+  constraint queues_storage_mode_check check (
+    storage_mode in ('unpartitioned', 'partitioned')
+  ),
+  constraint queues_default_partition_check check (
+    default_partition in ('enabled', 'disabled')
+  ),
+  constraint queues_partition_lookahead_check check (
+    partition_lookahead >= interval '0 seconds'
+  ),
+  constraint queues_partition_lookback_check check (
+    partition_lookback >= interval '0 seconds'
+  ),
+  constraint queues_cleanup_ttl_check check (
+    cleanup_ttl >= interval '0 seconds'
+  ),
+  constraint queues_cleanup_limit_check check (
+    cleanup_limit >= 1
+  ),
+  constraint queues_detach_mode_check check (
+    detach_mode in ('none', 'empty')
+  ),
+  constraint queues_detach_min_age_check check (
+    detach_min_age >= interval '0 seconds'
+  )
+);
+
+create or replace function otra._protect_queue_storage_identity ()
+returns trigger as $$
+begin
+  if new.id is distinct from old.id
+     or new.storage_mode is distinct from old.storage_mode then
+    raise exception 'queue storage identity is immutable';
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists queues_storage_identity_guard on otra.queues;
+create trigger queues_storage_identity_guard
+before update on otra.queues
+for each row execute function otra._protect_queue_storage_identity();
 
 create table if not exists otra.executions (
   id               uuid primary key default otra.uuid_v7(),
@@ -181,6 +287,558 @@ create table if not exists otra.events (
 
 create unique index if not exists events_fact_idx
   on otra.events (queue, name);
+
+------------------------------------------------------------------------------
+-- queue provisioning
+------------------------------------------------------------------------------
+
+-- Queue names remain compact routing labels; physical identifiers derive from
+-- the queue UUID so labels cannot collide with generated relations.
+create or replace function otra.validate_queue_name (p_name text) returns text as $$
+begin
+  if p_name is null or p_name = '' then
+    raise exception 'Queue name must be provided';
+  end if;
+  if octet_length(p_name) > 57 then
+    raise exception 'Queue name "%" is too long (max 57 bytes).', p_name;
+  end if;
+  return p_name;
+end;
+$$ language plpgsql immutable;
+
+drop function if exists otra._ensure_queue_tables (text);
+create or replace function otra._ensure_queue_tables (p_queue uuid) returns void as $$
+declare
+  v_storage text := replace(p_queue::text, '-', '');
+  v_x text := 'x_' || v_storage;
+  v_p text := 'p_' || v_storage;
+  v_e text := 'e_' || v_storage;
+  v_i text := 'i_' || v_storage;
+  v_mode text;
+  v_partition_suffix text := '';
+begin
+  select storage_mode into v_mode from otra.queues where id = p_queue;
+  if v_mode is null then
+    raise exception 'Queue % is not provisioned', p_queue;
+  end if;
+  if v_mode = 'partitioned' then
+    v_partition_suffix := 'partition by range (root_id)';
+  end if;
+
+  execute format(
+    'create table if not exists otra.%I (
+       id                  uuid not null default otra.uuid_v7(),
+       function_name       text not null,
+       params              jsonb,
+       status              text not null default ''pending'',
+       attempt             int not null default 0,
+       max_attempts        int not null default 5,
+       retry_strategy      jsonb not null default ''{"kind": "exponential", "base_s": 1, "factor": 2, "max_s": 300}'',
+       run_after           timestamptz not null default otra.now(),
+       claimed_by          text,
+       claim_expires_at    timestamptz,
+       root_id             uuid not null,
+       parent_id           uuid,
+       result              jsonb,
+       error               jsonb,
+       idempotency_key     text,
+       cancel_requested_at timestamptz,
+       cancel_reason       text,
+       on_parent_cancel    text not null default ''cascade'',
+       created_at          timestamptz not null default otra.now(),
+       updated_at          timestamptz not null default otra.now(),
+       finished_at         timestamptz,
+       primary key (root_id, id),
+       foreign key (root_id, parent_id) references otra.%I (root_id, id) on delete cascade,
+       check (status in (''pending'', ''running'', ''suspended'', ''completed'', ''failed'', ''cancelled'')),
+       check (on_parent_cancel in (''cascade'', ''detach'')),
+       check (parent_id is not null or root_id = id)
+     ) %s',
+    v_x,
+    v_x,
+    v_partition_suffix
+  );
+
+  execute format(
+    'create table if not exists otra.%I (
+       id                 uuid not null default otra.uuid_v7(),
+       root_id            uuid not null,
+       execution_id       uuid not null,
+       key                text not null,
+       label              text not null,
+       kind               text not null,
+       status             text not null default ''pending'',
+       value              jsonb,
+       error              jsonb,
+       wake_at            timestamptz,
+       event_name         text,
+       child_execution_id uuid,
+       created_at         timestamptz not null default otra.now(),
+       settled_at         timestamptz,
+       primary key (root_id, id),
+       foreign key (root_id, execution_id) references otra.%I (root_id, id) on delete cascade,
+       foreign key (root_id, child_execution_id) references otra.%I (root_id, id) on delete cascade,
+       check (kind in (''run'', ''sleep'', ''event'', ''child'', ''external'', ''cancel'')),
+       check (status in (''pending'', ''resolved'', ''rejected'')),
+       unique (root_id, execution_id, key)
+     ) %s',
+    v_p,
+    v_x,
+    v_x,
+    v_partition_suffix
+  );
+
+  execute format(
+    'create table if not exists otra.%I (
+       id         uuid primary key default otra.uuid_v7(),
+       name       text not null unique,
+       payload    jsonb,
+       created_at timestamptz not null default otra.now()
+     )',
+    v_e
+  );
+
+  if v_mode = 'partitioned' then
+    execute format(
+      'create table if not exists otra.%I (
+         idempotency_key text primary key,
+         root_id uuid not null,
+         execution_id uuid not null
+       )',
+      v_i
+    );
+  end if;
+
+  execute format(
+    'create index if not exists %I on otra.%I (run_after) where status = ''pending''',
+    'xi_' || v_storage || '_ri',
+    v_x
+  );
+  execute format(
+    'create index if not exists %I on otra.%I (claim_expires_at) where status = ''running''',
+    'xi_' || v_storage || '_cei',
+    v_x
+  );
+  execute format(
+    'create index if not exists %I on otra.%I (parent_id) where parent_id is not null',
+    'xi_' || v_storage || '_pi',
+    v_x
+  );
+  if v_mode = 'unpartitioned' then
+    execute format(
+      'create unique index if not exists %I on otra.%I (idempotency_key) where idempotency_key is not null',
+      'xi_' || v_storage || '_ii',
+      v_x
+    );
+  end if;
+  execute format(
+    'create index if not exists %I on otra.%I (wake_at) where status = ''pending'' and wake_at is not null',
+    'pi_' || v_storage || '_wi',
+    v_p
+  );
+  execute format(
+    'create index if not exists %I on otra.%I (event_name) where status = ''pending'' and kind = ''event''',
+    'pi_' || v_storage || '_ei',
+    v_p
+  );
+  execute format(
+    'create index if not exists %I on otra.%I (child_execution_id) where kind = ''child''',
+    'pi_' || v_storage || '_ci',
+    v_p
+  );
+end;
+$$ language plpgsql;
+
+create or replace function otra.ensure_partitions (p_name text default null) returns void as $$
+declare
+  v_now timestamptz := otra.now();
+  v_start timestamptz;
+  v_end timestamptz;
+  v_week timestamptz;
+  v_next timestamptz;
+  v_lower uuid;
+  v_upper uuid;
+  v_tag text;
+  v_storage text;
+  v_x text;
+  v_p text;
+  v_queue record;
+begin
+  if p_name is not null and not exists (select 1 from otra.queues where name = p_name) then
+    raise exception 'Queue "%" does not exist', p_name;
+  end if;
+
+  for v_queue in
+    select q.id, q.name, q.default_partition,
+           q.partition_lookahead, q.partition_lookback
+      from otra.queues q
+     where q.storage_mode = 'partitioned'
+       and (p_name is null or q.name = p_name)
+     order by q.id
+       for update
+  loop
+    v_storage := replace(v_queue.id::text, '-', '');
+    v_x := 'x_' || v_storage;
+    v_p := 'p_' || v_storage;
+    v_start := otra.week_bucket_utc(v_now - v_queue.partition_lookback);
+    v_end := otra.week_bucket_utc(v_now + v_queue.partition_lookahead);
+
+    if v_queue.default_partition = 'enabled' then
+      execute format(
+        'create table if not exists otra.%I partition of otra.%I default',
+        v_x || '_d', v_x
+      );
+      execute format(
+        'create table if not exists otra.%I partition of otra.%I default',
+        v_p || '_d', v_p
+      );
+    end if;
+
+    v_week := v_start;
+    while v_week <= v_end loop
+      v_next := v_week + interval '7 days';
+      v_tag := otra.partition_week_tag(v_week);
+      v_lower := otra.uuid_v7_floor(v_week);
+      v_upper := otra.uuid_v7_floor(v_next);
+      execute format(
+        'create table if not exists otra.%I partition of otra.%I
+         for values from (%L::uuid) to (%L::uuid)',
+        v_x || '_' || v_tag, v_x, v_lower, v_upper
+      );
+      execute format(
+        'create table if not exists otra.%I partition of otra.%I
+         for values from (%L::uuid) to (%L::uuid)',
+        v_p || '_' || v_tag, v_p, v_lower, v_upper
+      );
+      v_week := v_next;
+    end loop;
+  end loop;
+end;
+$$ language plpgsql;
+
+create or replace function otra.create_queue (p_name text, p_storage_mode text) returns void as $$
+declare
+  v_queue uuid;
+  v_mode text := lower(trim(coalesce(p_storage_mode, '')));
+  v_existing_mode text;
+begin
+  p_name := otra.validate_queue_name(p_name);
+  if v_mode not in ('unpartitioned', 'partitioned') then
+    raise exception 'Unsupported queue storage mode "%"', p_storage_mode;
+  end if;
+  insert into otra.queues (name, storage_mode) values (p_name, v_mode)
+  on conflict (name) do nothing;
+  select id, storage_mode into strict v_queue, v_existing_mode
+    from otra.queues where name = p_name for update;
+  if v_existing_mode <> v_mode then
+    raise exception 'Queue "%" already exists with storage mode "%"',
+      p_name, v_existing_mode;
+  end if;
+  perform otra._ensure_queue_tables(v_queue);
+  if v_mode = 'partitioned' then
+    perform otra.ensure_partitions(p_name);
+  end if;
+end;
+$$ language plpgsql;
+
+create or replace function otra.create_queue (p_name text) returns void as $$
+begin
+  perform otra.create_queue(p_name, 'unpartitioned');
+end;
+$$ language plpgsql;
+
+create or replace function otra.get_queue (p_name text)
+returns table (name text, storage_mode text) as $$
+  select q.name, q.storage_mode from otra.queues q where q.name = p_name;
+$$ language sql stable;
+
+create or replace function otra.list_queues ()
+returns table (name text, storage_mode text) as $$
+  select q.name, q.storage_mode from otra.queues q order by q.name;
+$$ language sql stable;
+
+create or replace function otra.get_queue_policy (p_name text)
+returns table (
+  name text,
+  storage_mode text,
+  default_partition text,
+  partition_lookahead interval,
+  partition_lookback interval,
+  cleanup_ttl interval,
+  cleanup_limit int,
+  detach_mode text,
+  detach_min_age interval
+) as $$
+  select q.name, q.storage_mode, q.default_partition,
+         q.partition_lookahead, q.partition_lookback,
+         q.cleanup_ttl, q.cleanup_limit, q.detach_mode, q.detach_min_age
+    from otra.queues q
+   where q.name = p_name;
+$$ language sql stable;
+
+create or replace function otra.set_queue_policy (p_name text, p_policy jsonb)
+returns void as $$
+declare
+  v_unknown text;
+  v_lookahead interval;
+  v_lookback interval;
+  v_cleanup_ttl interval;
+  v_cleanup_limit int;
+  v_detach_mode text;
+  v_detach_min_age interval;
+  v_default_partition text;
+  v_previous_default text;
+  v_storage_mode text;
+  v_queue_id uuid;
+  v_storage text;
+  v_parent text;
+  v_default text;
+  v_attached boolean;
+  v_has_rows boolean;
+  v_prefix text;
+begin
+  select key into v_unknown
+    from jsonb_object_keys(coalesce(p_policy, '{}'::jsonb)) as keys(key)
+   where key not in (
+     'partition_lookahead', 'partition_lookback', 'cleanup_ttl',
+     'cleanup_limit', 'detach_mode', 'detach_min_age', 'default_partition'
+   )
+   limit 1;
+  if v_unknown is not null then
+    raise exception 'Unknown queue policy key "%"', v_unknown;
+  end if;
+
+  select q.id, q.storage_mode, q.default_partition,
+         q.partition_lookahead, q.partition_lookback,
+         q.cleanup_ttl, q.cleanup_limit, q.detach_mode, q.detach_min_age
+    into v_queue_id, v_storage_mode, v_default_partition,
+         v_lookahead, v_lookback, v_cleanup_ttl,
+         v_cleanup_limit, v_detach_mode, v_detach_min_age
+    from otra.queues q
+   where q.name = p_name
+     for update;
+  if not found then
+    raise exception 'Queue "%" does not exist', p_name;
+  end if;
+
+  if p_policy ? 'partition_lookahead' then
+    v_lookahead := (p_policy ->> 'partition_lookahead')::interval;
+  end if;
+  if p_policy ? 'partition_lookback' then
+    v_lookback := (p_policy ->> 'partition_lookback')::interval;
+  end if;
+  if p_policy ? 'cleanup_ttl' then
+    v_cleanup_ttl := (p_policy ->> 'cleanup_ttl')::interval;
+  end if;
+  if p_policy ? 'cleanup_limit' then
+    v_cleanup_limit := (p_policy ->> 'cleanup_limit')::int;
+  end if;
+  if p_policy ? 'detach_mode' then
+    v_detach_mode := lower(trim(coalesce(p_policy ->> 'detach_mode', '')));
+  end if;
+  if p_policy ? 'detach_min_age' then
+    v_detach_min_age := (p_policy ->> 'detach_min_age')::interval;
+  end if;
+  v_previous_default := v_default_partition;
+  if p_policy ? 'default_partition' then
+    v_default_partition := lower(trim(coalesce(p_policy ->> 'default_partition', '')));
+  end if;
+
+  if v_lookahead < interval '0 seconds' then
+    raise exception 'partition_lookahead must be non-negative';
+  end if;
+  if v_lookback < interval '0 seconds' then
+    raise exception 'partition_lookback must be non-negative';
+  end if;
+  if v_cleanup_ttl < interval '0 seconds' then
+    raise exception 'cleanup_ttl must be non-negative';
+  end if;
+  if v_cleanup_limit < 1 then
+    raise exception 'cleanup_limit must be at least 1';
+  end if;
+  if v_detach_mode not in ('none', 'empty') then
+    raise exception 'Unsupported detach mode "%"', v_detach_mode;
+  end if;
+  if v_detach_min_age < interval '0 seconds' then
+    raise exception 'detach_min_age must be non-negative';
+  end if;
+  if v_default_partition not in ('enabled', 'disabled') then
+    raise exception 'Unsupported default_partition mode "%"', v_default_partition;
+  end if;
+  if v_storage_mode <> 'partitioned' and p_policy ? 'default_partition' then
+    raise exception 'default_partition policy is only supported for partitioned queues';
+  end if;
+
+  update otra.queues
+     set default_partition = v_default_partition,
+         partition_lookahead = v_lookahead,
+         partition_lookback = v_lookback,
+         cleanup_ttl = v_cleanup_ttl,
+         cleanup_limit = v_cleanup_limit,
+         detach_mode = v_detach_mode,
+         detach_min_age = v_detach_min_age
+   where name = p_name;
+
+  if v_storage_mode = 'partitioned'
+     and v_previous_default <> v_default_partition then
+    if v_default_partition = 'enabled' then
+      perform otra.ensure_partitions(p_name);
+    else
+      v_storage := replace(v_queue_id::text, '-', '');
+      -- Partition maintenance takes parent locks before leaf locks. Queue-local
+      -- coordination takes a compatible lock on the queue row before touching
+      -- either family, so policy changes form a maintenance barrier.
+      execute format(
+        'lock table otra.%I in access exclusive mode',
+        'x_' || v_storage
+      );
+      execute format(
+        'lock table otra.%I in access exclusive mode',
+        'p_' || v_storage
+      );
+      foreach v_prefix in array array['p', 'x'] loop
+        v_parent := v_prefix || '_' || v_storage;
+        v_default := v_parent || '_d';
+        select exists (
+          select 1
+            from pg_inherits i
+            join pg_class parent on parent.oid = i.inhparent
+            join pg_class child on child.oid = i.inhrelid
+            join pg_namespace n on n.oid = parent.relnamespace
+           where n.nspname = 'otra'
+             and parent.relname = v_parent
+             and child.relname = v_default
+        ) into v_attached;
+        if not v_attached then
+          continue;
+        end if;
+        execute format('lock table otra.%I in access exclusive mode', v_default);
+        execute format('select exists (select 1 from otra.%I limit 1)', v_default)
+          into v_has_rows;
+        if v_has_rows then
+          raise exception
+            'Cannot disable default_partition for queue "%": default partition "%" is not empty',
+            p_name, v_default;
+        end if;
+        execute format(
+          'alter table otra.%I detach partition otra.%I',
+          v_parent, v_default
+        );
+        execute format('drop table otra.%I', v_default);
+      end loop;
+    end if;
+  end if;
+end;
+$$ language plpgsql;
+
+-- Discover old empty partitions. Detach itself remains a top-level operator
+-- action because PostgreSQL cannot run DETACH PARTITION CONCURRENTLY here.
+create or replace function otra.list_detach_candidates (p_name text default null)
+returns table (queue_name text, parent_table text, partition_table text) as $$
+declare
+  v_now timestamptz := otra.now();
+  v_queue record;
+  v_x_parent text;
+  v_p_parent text;
+  v_x_parent_oid oid;
+  v_p_parent_oid oid;
+  v_partition record;
+  v_p_partition text;
+  v_suffix text;
+  v_upper uuid;
+  v_upper_at timestamptz;
+  v_x_has_rows boolean;
+  v_p_has_rows boolean;
+  v_p_attached boolean;
+  v_storage text;
+begin
+  if p_name is not null and not exists (select 1 from otra.queues where name = p_name) then
+    raise exception 'Queue "%" does not exist', p_name;
+  end if;
+
+  for v_queue in
+    select q.id, q.name, q.detach_min_age
+      from otra.queues q
+     where q.storage_mode = 'partitioned'
+       and q.detach_mode = 'empty'
+       and (p_name is null or q.name = p_name)
+     order by q.name
+  loop
+    v_storage := replace(v_queue.id::text, '-', '');
+    v_x_parent := 'x_' || v_storage;
+    v_p_parent := 'p_' || v_storage;
+    select c.oid into v_x_parent_oid
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'otra' and c.relname = v_x_parent;
+    select c.oid into v_p_parent_oid
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'otra' and c.relname = v_p_parent;
+    if v_x_parent_oid is null or v_p_parent_oid is null then
+      continue;
+    end if;
+
+    for v_partition in
+      select child.relname as name,
+             pg_get_expr(child.relpartbound, child.oid) as bound
+        from pg_inherits i
+        join pg_class child on child.oid = i.inhrelid
+       where i.inhparent = v_x_parent_oid
+    loop
+      if v_partition.bound = 'DEFAULT' then
+        continue;
+      end if;
+      select (regexp_match(
+        v_partition.bound,
+        'TO \(''([^'']+)''(::uuid)?\)'
+      ))[1]::uuid into v_upper;
+      if v_upper is null then
+        continue;
+      end if;
+      v_upper_at := otra.uuid_v7_timestamp(v_upper);
+      if v_upper_at is null
+         or v_upper_at >= v_now - v_queue.detach_min_age then
+        continue;
+      end if;
+
+      v_suffix := substring(v_partition.name from length(v_x_parent) + 1);
+      v_p_partition := v_p_parent || v_suffix;
+      select exists (
+        select 1
+          from pg_inherits i
+          join pg_class child on child.oid = i.inhrelid
+         where i.inhparent = v_p_parent_oid
+           and child.relname = v_p_partition
+      ) into v_p_attached;
+      if not v_p_attached then
+        continue;
+      end if;
+
+      execute format(
+        'select exists (select 1 from otra.%I limit 1)',
+        v_partition.name
+      ) into v_x_has_rows;
+      execute format(
+        'select exists (select 1 from otra.%I limit 1)',
+        v_p_partition
+      ) into v_p_has_rows;
+      if v_x_has_rows or v_p_has_rows then
+        continue;
+      end if;
+
+      queue_name := v_queue.name;
+      parent_table := v_p_parent;
+      partition_table := v_p_partition;
+      return next;
+      queue_name := v_queue.name;
+      parent_table := v_x_parent;
+      partition_table := v_partition.name;
+      return next;
+    end loop;
+  end loop;
+end;
+$$ language plpgsql;
 
 ------------------------------------------------------------------------------
 -- internal helpers

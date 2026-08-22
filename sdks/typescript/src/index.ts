@@ -1,5 +1,5 @@
 export { Otra } from "./app.ts";
-export type { OtraOptions, GetResultOptions } from "./app.ts";
+export type { OtraOptions, GetResultOptions, CreateQueueOptions } from "./app.ts";
 export { Ctx, parseDuration } from "./context.ts";
 export type { HandleResults } from "./context.ts";
 export {
@@ -9,7 +9,17 @@ export {
   parsePromiseToken,
   promiseToken,
 } from "./db.ts";
-export type { ClaimedExecution, PromiseRow, Queryable } from "./db.ts";
+export type {
+  ClaimedExecution,
+  DetachCandidate,
+  PromiseRow,
+  Queryable,
+  Queue,
+  QueueDetachMode,
+  QueuePolicy,
+  QueuePolicyOptions,
+  QueueStorageMode,
+} from "./db.ts";
 export { driveOnce } from "./driver.ts";
 export type { DriveOptions, DriveOutcome } from "./driver.ts";
 export { Worker } from "./worker.ts";
