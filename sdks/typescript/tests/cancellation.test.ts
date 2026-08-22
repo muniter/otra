@@ -19,7 +19,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("cancelling a pending execution with no history finalizes immediately", async () => {

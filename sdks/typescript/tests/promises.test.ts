@@ -16,7 +16,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("human-in-the-loop: outside code resolves a promise by token", async () => {

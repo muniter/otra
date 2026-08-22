@@ -14,7 +14,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 /** Spawn + claim one execution for worker w1 and return its route. */

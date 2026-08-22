@@ -8,7 +8,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("a zombie worker cannot fail an execution it does not own", async () => {

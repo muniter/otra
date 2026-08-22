@@ -15,7 +15,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("compensation can call a durable child task and await it", async () => {

@@ -9,7 +9,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("a failing step retries the task with backoff; finished steps are skipped", async () => {

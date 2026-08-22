@@ -33,7 +33,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await a.end();
   await b.end();
-  await env.close();
+  await env?.close();
 });
 
 async function waitUntilBlockedOnLock(pid: number): Promise<void> {

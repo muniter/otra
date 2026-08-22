@@ -8,7 +8,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("UUIDv7 generation follows the shared database clock", async () => {

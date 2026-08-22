@@ -9,7 +9,7 @@ beforeEach(async () => {
   env = await createTestEnv();
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("parent suspends while awaiting a same-queue child, then resumes", async () => {

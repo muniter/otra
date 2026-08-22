@@ -11,7 +11,7 @@ beforeEach(async () => {
   env = await createTestEnv("orders", false);
 });
 afterEach(async () => {
-  await env.close();
+  await env?.close();
 });
 
 test("provisions and discovers an unpartitioned queue", async () => {
