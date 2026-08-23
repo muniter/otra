@@ -121,6 +121,16 @@ systems, and the decisions already made so you don't relitigate them.
   (`select otra.set_fake_now(...)`) and step it
   (`select otra.advance_fake_now(interval ...)`); workers are driven manually
   with `worker.tick()` / `worker.drain()` — never `sleep()` and hope.
+- **Wakeups are LISTEN/NOTIFY-driven** (`src/wake.ts`): one lazy dedicated
+  `LISTEN otra_wake` connection per app (application_name `otra-listen`),
+  shared by workers and `getResult`. NOTIFY is best-effort, so three
+  fallbacks keep it sound: a reconnect emits a `null` reset wake ("poll
+  once, you may have missed something"), idle workers sleep until
+  `otra.next_due_local(queue)` (earliest timer/retry/lease-expiry/deadline —
+  clock-driven work never notifies), and `pollIntervalMs` remains a slow
+  safety-net poll (60s default when listening). If you add a state
+  transition that makes work runnable NOW, it must `pg_notify('otra_wake',
+  <queue name>)` — on commit, which is what pg_notify does.
 - **Gates, not sleeps:** async coordination in tests uses `EventEmitter` +
   `once(gate, "release")` rendezvous (a pattern taken from absurd's TS
   suite) and a `waitFor(condition)` poller
@@ -216,18 +226,16 @@ propagate up, cancellations propagate down the tree"):
 
 ## Known backlog (in rough priority order)
 
-1. LISTEN/NOTIFY wakeups — the SQL already emits `otra_wake` /
-   `pg_notify`; workers still poll. Also removes `getResult` polling.
-2. Cancellation remaining tiers: leaf-first finalization (parent waits for
+1. Cancellation remaining tiers: leaf-first finalization (parent waits for
    descendants before compensating), preemptible runs (AbortSignal into the
    step fn, result discarded — DBOS-style), operator pause/resume as a
    distinct `paused` status (sound only because compensation didn't run).
-3. `TaskError` rename/cleanup (watchlist: exists only to mark
+2. `TaskError` rename/cleanup (watchlist: exists only to mark
    non-retryable; consider `NonRetryableError`).
-4. History growth: no continue-as-new equivalent yet; long-looping tasks
+3. History growth: no continue-as-new equivalent yet; long-looping tasks
    replay O(history). `docs/cron.md` tells users to avoid durable sleep
    loops for exactly this reason — revisit it when continue-as-new lands.
-5. npm publish (the name `otra` was free as of 2026-08).
+4. npm publish (the name `otra` was free as of 2026-08).
 
 ## Sharp edges to keep in mind
 

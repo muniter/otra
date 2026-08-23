@@ -32,6 +32,8 @@ export type {
 } from "./db.ts";
 export { driveOnce } from "./driver.ts";
 export type { DriveOptions, DriveOutcome } from "./driver.ts";
+export { WakeHub } from "./wake.ts";
+export type { WakeSource } from "./wake.ts";
 export { Worker } from "./worker.ts";
 export type { WorkerOptions } from "./worker.ts";
 export {

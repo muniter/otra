@@ -833,6 +833,20 @@ export class Db {
     return rows[0].created === true;
   }
 
+  /**
+   * Milliseconds until the queue's earliest clock-driven work (timer,
+   * retry, lease expiry, deadline) is due; 0 when overdue, null when
+   * nothing is scheduled. Lets a LISTENing worker sleep precisely.
+   */
+  async nextDueMs(queue: string): Promise<number | null> {
+    const { rows } = await this.client.query(
+      `select ceil(extract(epoch from (otra.next_due_local($1) - otra.now())) * 1000)::float8 as ms`,
+      [queue],
+    );
+    const ms = rows[0].ms as number | null;
+    return ms === null ? null : Math.max(0, Number(ms));
+  }
+
   /** Database clock (otra.now()), epoch milliseconds -- honors the fake clock. */
   async now(): Promise<number> {
     const { rows } = await this.client.query(`select otra.now() as now`);

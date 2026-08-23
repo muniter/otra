@@ -174,6 +174,13 @@ through:
 `app.ensurePartitions(name?)`, `app.listDetachCandidates(name?)`,
 `app.createWorker()` / `app.startWorker()`, `app.applySchema()`.
 
+Started workers are event-driven, not polling: each app shares one
+`LISTEN otra_wake` connection, every wake-worthy transition in the schema
+notifies it on commit, and an idle worker otherwise sleeps exactly until the
+queue's earliest timer/retry/deadline (`otra.next_due_local`). A slow poll
+(60s) remains as the safety net against lost notifications, and `getResult`
+wakes on the completion notify instead of polling out its backoff.
+
 Top-level spawns accept an `idempotencyKey` (at-most-one execution per
 `(queue, key)`, race-safe), protecting the API boundary against double
 delivery -- child spawns are already deduplicated by the parent's promise
@@ -322,8 +329,6 @@ claim (absurd `4aec33e`).
 An experiment, not a product. Deliberately out of scope so far, roughly in
 the order they'd matter:
 
-- `LISTEN/NOTIFY`-driven wakeups (the SQL already emits `otra_wake`
-  notifications; the worker currently just polls).
 - A `race` combinator next to `all`.
 - Cancellation, remaining tiers: leaf-first finalization (a parent waits for
   descendants before compensating), preemptible runs, operator

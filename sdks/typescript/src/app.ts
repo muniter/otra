@@ -15,6 +15,7 @@ import {
   type QueueStorageMode,
   type RetryOutcome,
 } from "./db.ts";
+import { WakeHub } from "./wake.ts";
 import { Worker, type WorkerOptions } from "./worker.ts";
 import {
   ExecutionFailedError,
@@ -70,6 +71,8 @@ export class Otra {
   private readonly pool: Queryable;
   private readonly ownedPool: pg.Pool | null;
   private readonly workers = new Set<Worker>();
+  /** LISTEN otra_wake hub; null when the db handle cannot LISTEN. */
+  private readonly wakeHub: WakeHub | null;
 
   constructor(options: OtraOptions = {}) {
     this.queue = options.queue ?? "default";
@@ -89,6 +92,14 @@ export class Otra {
       this.pool = this.ownedPool;
     }
     this.db = new Db(this.pool);
+    // LISTEN needs a dedicated connection; a bare Queryable can't provide
+    // one, so listening quietly degrades to polling in that case.
+    const listenPool =
+      this.ownedPool ??
+      (isPool(db) && typeof (db as pg.Pool).connect === "function"
+        ? (db as pg.Pool)
+        : null);
+    this.wakeHub = listenPool === null ? null : new WakeHub(listenPool);
   }
 
   /**
@@ -344,33 +355,55 @@ export class Otra {
     // Exponential backoff from pollMs to a 1s ceiling, clamped to the
     // remaining budget: a flat 25ms interval against a 30s timeout was up
     // to 1200 round trips per wait (an absurd lesson, their 7def1b9).
+    // Terminal transitions NOTIFY, so when the app can LISTEN the backoff
+    // sleep is cut short the instant anything on the database moves --
+    // `woken` closes the race between polling and parking.
     let interval = pollMs;
-    while (true) {
-      const snapshot = await this.db.getExecution(execution);
-      const executionId = execution.executionId;
-      if (snapshot === null) {
-        throw new ExecutionFailedError(executionId, "failed", {
-          message: "execution not found",
-        });
+    let woken = false;
+    let wakeNow: (() => void) | null = null;
+    const unsubscribe = this.wakeHub?.subscribe(() => {
+      woken = true;
+      wakeNow?.();
+    });
+    try {
+      while (true) {
+        woken = false;
+        const snapshot = await this.db.getExecution(execution);
+        const executionId = execution.executionId;
+        if (snapshot === null) {
+          throw new ExecutionFailedError(executionId, "failed", {
+            message: "execution not found",
+          });
+        }
+        if (snapshot.status === "completed") return snapshot.result as R;
+        if (snapshot.status === "failed" || snapshot.status === "cancelled") {
+          throw new ExecutionFailedError(
+            executionId,
+            snapshot.status,
+            snapshot.error,
+          );
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new TimeoutError(
+            `timed out waiting for execution ${executionId}`,
+          );
+        }
+        if (!woken) {
+          await new Promise<void>((resolve) => {
+            wakeNow = resolve;
+            if (woken) {
+              resolve();
+              return;
+            }
+            setTimeout(resolve, Math.min(interval, remaining));
+          });
+          wakeNow = null;
+        }
+        interval = Math.min(interval * 2, 1000);
       }
-      if (snapshot.status === "completed") return snapshot.result as R;
-      if (snapshot.status === "failed" || snapshot.status === "cancelled") {
-        throw new ExecutionFailedError(
-          executionId,
-          snapshot.status,
-          snapshot.error,
-        );
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new TimeoutError(
-          `timed out waiting for execution ${executionId}`,
-        );
-      }
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.min(interval, remaining)),
-      );
-      interval = Math.min(interval * 2, 1000);
+    } finally {
+      unsubscribe?.();
     }
   }
 
@@ -434,6 +467,7 @@ export class Otra {
   createWorker(options: WorkerOptions = {}): Worker {
     const worker = new Worker(this.db, this.registry, {
       queue: this.queue,
+      wake: this.wakeHub ?? undefined,
       ...options,
     });
     this.workers.add(worker);
@@ -473,6 +507,7 @@ export class Otra {
   async close(): Promise<void> {
     await Promise.all([...this.workers].map((worker) => worker.stop()));
     this.workers.clear();
+    this.wakeHub?.close();
     await this.ownedPool?.end();
   }
 }

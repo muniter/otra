@@ -3,6 +3,7 @@ import * as os from "node:os";
 import type { Db } from "./db.ts";
 import { driveOnce, type DriveOutcome } from "./driver.ts";
 import { serializeError, type RegisteredTask } from "./types.ts";
+import type { WakeSource } from "./wake.ts";
 
 export interface WorkerOptions {
   queue?: string;
@@ -13,8 +14,16 @@ export interface WorkerOptions {
   concurrency?: number;
   /** How many executions to claim per poll (default: concurrency). */
   batchSize?: number;
-  /** Poll interval in milliseconds when the queue is empty. */
+  /**
+   * Fallback poll interval in milliseconds when the queue is empty.
+   * Defaults to 250ms for a pure polling worker, and to 60s when a wake
+   * source is attached: notifications cover event-driven wakes and
+   * next_due bounds the sleep for clock-driven ones, so the poll is only
+   * a safety net against lost notifications.
+   */
   pollIntervalMs?: number;
+  /** Wake source (LISTEN otra_wake); injected by Otra.createWorker. */
+  wake?: WakeSource;
   onError?: (err: unknown) => void;
 }
 
@@ -49,6 +58,9 @@ export class Worker {
   private running = false;
   private loop: Promise<void> | null = null;
   private wake: (() => void) | null = null;
+  private pendingWake = false;
+  private readonly wakeSource: WakeSource | null;
+  private unsubscribeWake: (() => void) | null = null;
   private readonly inflight = new Set<Promise<void>>();
 
   private readonly db: Db;
@@ -66,7 +78,9 @@ export class Worker {
     this.claimSeconds = options.claimSeconds ?? 30;
     this.concurrency = options.concurrency ?? 5;
     this.batchSize = options.batchSize ?? this.concurrency;
-    this.pollIntervalMs = options.pollIntervalMs ?? 250;
+    this.wakeSource = options.wake ?? null;
+    this.pollIntervalMs =
+      options.pollIntervalMs ?? (this.wakeSource !== null ? 60_000 : 250);
     this.onError =
       options.onError ?? ((err) => console.error("otra worker error:", err));
   }
@@ -165,6 +179,12 @@ export class Worker {
   start(): void {
     if (this.running) return;
     this.running = true;
+    // Park on LISTEN: any wake addressed to this queue (or a reset after a
+    // reconnect, which may have missed one) interrupts the idle sleep.
+    this.unsubscribeWake =
+      this.wakeSource?.subscribe((queue) => {
+        if (queue === null || queue === this.queue) this.notify();
+      }) ?? null;
     this.loop = (async () => {
       while (this.running) {
         let claimed = 0;
@@ -196,12 +216,38 @@ export class Worker {
         }
         if (!this.running) break;
         if (claimed === 0) {
-          await new Promise<void>((resolve) => {
-            this.wake = resolve;
-            const timer = setTimeout(resolve, this.pollIntervalMs);
-            timer.unref?.();
-          });
-          this.wake = null;
+          // pendingWake closes the race between claiming nothing and
+          // parking: a notification landing in that gap must not be lost
+          // under a long fallback interval.
+          if (!this.pendingWake) {
+            let waitMs = this.pollIntervalMs;
+            if (this.wakeSource !== null) {
+              // Clock-driven work (timers, retries, lease expiries,
+              // deadlines) never notifies; sleep exactly until the earliest
+              // of it instead of polling for it.
+              try {
+                const dueMs = await this.db.nextDueMs(this.queue);
+                if (dueMs !== null) {
+                  waitMs = Math.min(waitMs, Math.max(dueMs, 25));
+                }
+              } catch (err) {
+                this.onError(err);
+              }
+            }
+            if (!this.pendingWake) {
+              await new Promise<void>((resolve) => {
+                this.wake = resolve;
+                if (this.pendingWake) {
+                  resolve();
+                  return;
+                }
+                const timer = setTimeout(resolve, waitMs);
+                timer.unref?.();
+              });
+              this.wake = null;
+            }
+          }
+          this.pendingWake = false;
         }
       }
       await Promise.allSettled([...this.inflight]);
@@ -210,12 +256,15 @@ export class Worker {
 
   /** Nudge a sleeping poll loop (e.g. after a local spawn). */
   notify(): void {
+    this.pendingWake = true;
     this.wake?.();
   }
 
   /** Stop claiming and wait for in-flight executions to finish. */
   async stop(): Promise<void> {
     this.running = false;
+    this.unsubscribeWake?.();
+    this.unsubscribeWake = null;
     this.wake?.();
     await this.loop;
     this.loop = null;

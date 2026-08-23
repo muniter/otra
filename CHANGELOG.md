@@ -16,6 +16,20 @@ something other than `main`.
 
 ## Added
 
+* Wakeups are now LISTEN/NOTIFY-driven. Every app shares one lazy dedicated
+  `LISTEN otra_wake` connection; idle workers park on it and wake the moment
+  a spawn, event, settlement, cancellation, retry, or completion commits —
+  end-to-end latency drops from the poll interval to single-digit
+  milliseconds. Clock-driven work never notifies, so an idle worker instead
+  sleeps exactly until `otra.next_due_local(queue)` (the earliest pending
+  timer, retry, lease expiry, or deadline), and the polling loop survives
+  only as a slow safety net (60s default while listening). Terminal
+  transitions notify too, so `getResult` returns the instant an execution
+  finishes instead of polling out its backoff. The listener names itself
+  `otra-listen` in `pg_stat_activity`, reconnects with backoff if its
+  connection dies, and treats every (re)connect as a missed-notification
+  hazard by polling once immediately.
+
 * Queue storage can now be reclaimed: `app.dropQueue(name, { force })` drops a
   queue and every physical relation named after it. It refuses while any
   execution is still non-terminal — those workers would hit a vanished table
