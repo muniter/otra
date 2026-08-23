@@ -139,6 +139,38 @@ systems, and the decisions already made so you don't relitigate them.
   `once(gate, "release")` rendezvous (a pattern taken from absurd's TS
   suite) and a `waitFor(condition)` poller
   (`sdks/typescript/tests/helpers.ts`).
+- **Property tests** (`fast-check`): five layers, each with a knob.
+  `tests/properties.test.ts` holds pure/DB value properties (roundtrips,
+  bounds; `OTRA_PROPERTY_RUNS` multiplies the run counts).
+  `otra.check_invariants(queue)` is the machine-checked oracle for the
+  engine's cross-table rules (`tests/invariants.test.ts` proves it silent on
+  healthy state and loud on each seeded corruption) — call it at the end of
+  any chaos-style test, and when you add an engine transition, add its rule
+  there in the same commit. `tests/fuzz.test.ts` is crash/replay fuzzing:
+  programs are generated AS DATA (a JSON op tree interpreted by one generic
+  task, so replays are deterministic by construction and children get their
+  sub-programs as params) plus a fault schedule of injected step failures;
+  asserts reference-equal results, exactly one journal row per step, exactly
+  (failures + 1) real executions per step function, exact-once child
+  spawns, and a silent oracle. `OTRA_FUZZ_RUNS` deepens it (default 15;
+  200 runs ≈ 11s). Its teeth are proven: disabling run-memoization in the
+  driver is caught and SHRUNK to a minimal program. Identifiers inside
+  generators must be assigned by a pure post-generation walk — a
+  side-effecting counter in `.map` breaks fast-check's determinism and
+  shrinking. `tests/interleave.test.ts` is the pairwise serializability
+  differential: every pair of coordination calls fired concurrently on a
+  raw-SQL fixture must land on one of its two serial outcomes, canonicalized
+  by entity ROLE, never uuid (`OTRA_INTERLEAVE_TRIALS`). `tests/chaos.test.ts`
+  is multi-worker chaos — three workers, force-expired leases (one row per
+  statement, in `(root_id, id)` order: a bulk ordered `FOR UPDATE` across
+  roots is itself a deadlock source), cancels/kills at random rounds, the
+  oracle run between EVERY round because chaos corruption is transient
+  (`OTRA_CHAOS_RUNS`, default 8; 100 ≈ 9s; `OTRA_CHAOS_DEBUG=1` prints
+  per-case coverage). `.github/workflows/nightly.yml` soaks fuzz/chaos/
+  properties at depths CI cannot afford. This round's score so far: NaN
+  `max_s`, the `parseDuration` Infinity overflow, the jsonb-hostile poison
+  pill, and the zombie redrive spin — all found by these layers, all fixed
+  with the finding as the regression test.
 - **Race tests:** force the interleaving with two `pg.Client`s — session A
   holds a row lock in an open transaction, session B blocks, the test
   *observes* the block via `pg_stat_activity.wait_event_type = 'Lock'`,
@@ -249,6 +281,11 @@ propagate up, cancellations propagate down the tree"):
 - `ctx.cancelRequested` outside a `catch` is nondeterministic input across
   replays (same class as `Date.now()`); branching forward logic on it is a
   user error — the delivered `CancelledError` is the deterministic signal.
+- A graceful cancel requested while an execution is parked on its **last**
+  suspension point can race to `completed` (once the blocker settles the
+  replay is fully memoized: no yield needing new work remains to deliver
+  at). Never `failed`, never half-delivered; the chaos suite pins the exact
+  contract, `docs/cancellation-design.md` explains it.
 - The schema file is idempotent (`create or replace` + targeted
   `drop function` for signature changes) but there is **no migration story**
   for altering existing tables — `create table if not exists` won't alter.

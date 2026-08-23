@@ -3199,6 +3199,121 @@ $$ language plpgsql;
 -- the function it is about to recreate -- harmless, and cheaper than a
 -- version probe here just to skip it.
 drop function if exists otra.cleanup_local (text, interval, int);
+-- The invariant oracle: every cross-table consistency rule the engine
+-- promises, as a function that RETURNS the violations instead of describing
+-- them in prose.  Empty result = healthy.  Chaos, fuzz, and property tests
+-- call this after every run; when adding an engine transition, ask which of
+-- these rules it must preserve -- and if it introduces a new rule, add the
+-- check here in the same commit.  Read-only; safe on live systems.
+create or replace function otra.check_invariants (p_queue text)
+returns table (violation text) as $$
+declare
+  v_name text;
+  v_x text;
+  v_p text;
+begin
+  select q.name into v_name from otra.queues q where q.name = p_queue;
+  if not found then
+    raise exception 'Queue "%" does not exist', p_queue
+      using errcode = 'OT004';
+  end if;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
+
+  -- stuck-suspended: a suspended execution none of whose promises is
+  -- pending can never be woken by anything (the lost-wakeup made visible).
+  return query execute format(
+    'select ''stuck-suspended: suspended with no pending promise execution='' || e.id
+       from otra.%1$I e
+      where e.status = ''suspended''
+        and not exists (
+          select 1 from otra.%2$I p
+           where p.execution_id = e.id and p.status = ''pending''
+        )',
+    v_x, v_p
+  );
+
+  -- lost-settlement: a child promise still pending although the child
+  -- execution reached a terminal state (settlement happens in the child''s
+  -- terminal transaction, so this must never be observable).
+  return query execute format(
+    'select ''lost-settlement: pending child promise for terminal child promise='' || p.id
+       from otra.%2$I p
+       join otra.%1$I c on c.root_id = p.root_id and c.id = p.child_execution_id
+      where p.kind = ''child'' and p.status = ''pending''
+        and c.status in (''completed'', ''failed'', ''cancelled'')',
+    v_x, v_p
+  );
+
+  -- premature-settlement: the reverse direction.
+  return query execute format(
+    'select ''premature-settlement: settled child promise for live child promise='' || p.id
+       from otra.%2$I p
+       join otra.%1$I c on c.root_id = p.root_id and c.id = p.child_execution_id
+      where p.kind = ''child'' and p.status <> ''pending''
+        and c.status not in (''completed'', ''failed'', ''cancelled'')',
+    v_x, v_p
+  );
+
+  -- claim-incoherent: claim fields must match the status exactly.
+  return query execute format(
+    'select ''claim-incoherent: status='' || e.status || '' claimed_by='' ||
+            coalesce(e.claimed_by, ''<null>'') || '' execution='' || e.id
+       from otra.%1$I e
+      where (e.status = ''running''
+             and (e.claimed_by is null or e.claim_expires_at is null))
+         or (e.status in (''pending'', ''suspended'')
+             and e.claim_expires_at is not null)',
+    v_x
+  );
+
+  -- attempt-overflow: attempts never exceed the budget.
+  return query execute format(
+    'select ''attempt-overflow: '' || e.attempt || ''/'' || e.max_attempts ||
+            '' execution='' || e.id
+       from otra.%1$I e
+      where e.attempt > e.max_attempts',
+    v_x
+  );
+
+  -- terminal-incoherent: terminal iff finished_at.
+  return query execute format(
+    'select ''terminal-incoherent: status='' || e.status || '' finished_at='' ||
+            coalesce(e.finished_at::text, ''<null>'') || '' execution='' || e.id
+       from otra.%1$I e
+      where (e.status in (''completed'', ''failed'', ''cancelled'')) <>
+            (e.finished_at is not null)',
+    v_x
+  );
+
+  -- cancelled-unrequested: the cancelled outcome is owned by cancellation.
+  return query execute format(
+    'select ''cancelled-unrequested: execution='' || e.id
+       from otra.%1$I e
+      where e.status = ''cancelled'' and e.cancel_requested_at is null',
+    v_x
+  );
+
+  -- settlement-timestamps: settled promises carry settled_at; pending do not.
+  return query execute format(
+    'select ''settlement-timestamps: status='' || p.status || '' promise='' || p.id
+       from otra.%2$I p
+      where (p.status in (''resolved'', ''rejected'')) <> (p.settled_at is not null)',
+    v_x, v_p
+  );
+
+  -- cancel-journal: a completed execution must not carry a $cancel row
+  -- (complete_local refuses; nothing may sneak past it).
+  return query execute format(
+    'select ''cancel-journal: $cancel on completed execution='' || e.id
+       from otra.%1$I e
+       join otra.%2$I p on p.root_id = e.root_id and p.execution_id = e.id
+      where e.status = ''completed'' and p.key = ''$cancel''',
+    v_x, v_p
+  );
+end;
+$$ language plpgsql;
+
 create or replace function otra.cleanup_local (
   p_queue text default null,
   p_ttl interval default null,

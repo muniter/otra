@@ -1,0 +1,71 @@
+name: Nightly
+
+# Deep soak of the three property layers described in AGENTS.md. CI keeps its
+# 10-minute budget by running each of them at its cheap default; this workflow
+# is where the run counts get turned up far enough for the rare interleavings
+# to actually show up (crash/replay fuzzing, multi-worker chaos, value
+# properties).
+on:
+  schedule:
+    # 03:17 UTC daily. Off the hour on purpose: GitHub's scheduler queues
+    # everything submitted at :00 together.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Typecheck
+        run: make check
+
+      # The full suite at default depth, exactly as CI runs it. It also stages
+      # sql/schema.sql into the package (`pretest` -> prepare-assets), which
+      # the global setup below reads to build the template database.
+      - name: Test
+        run: make test
+
+      # The deep passes cannot go through `npm test`: scripts/run-tests.mjs
+      # globs every tests/*.test.ts file, and running the whole suite three
+      # more times would spend the budget on the cheap files. They invoke
+      # `node --test` on the single file instead, with the same
+      # --test-global-setup that starts the session-scoped Postgres
+      # Testcontainer and prepares the template each test clones from.
+      - name: Fuzz (deep)
+        working-directory: sdks/typescript
+        env:
+          OTRA_FUZZ_RUNS: 1500
+        run: |
+          node --experimental-strip-types --test --test-concurrency=1 \
+            --test-global-setup=tests/global-setup.ts tests/fuzz.test.ts
+
+      - name: Chaos (deep)
+        working-directory: sdks/typescript
+        env:
+          OTRA_CHAOS_RUNS: 100
+        run: |
+          node --experimental-strip-types --test --test-concurrency=1 \
+            --test-global-setup=tests/global-setup.ts tests/chaos.test.ts
+
+      - name: Properties (deep)
+        working-directory: sdks/typescript
+        env:
+          OTRA_PROPERTY_RUNS: 10
+        run: |
+          node --experimental-strip-types --test --test-concurrency=1 \
+            --test-global-setup=tests/global-setup.ts tests/properties.test.ts

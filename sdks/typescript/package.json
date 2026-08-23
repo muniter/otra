@@ -49,6 +49,7 @@
     "@testcontainers/postgresql": "^12.1.0",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.4",
+    "fast-check": "^4.9.0",
     "typescript": "^5.9.2"
   },
   "allowScripts": {

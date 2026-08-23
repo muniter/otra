@@ -16,6 +16,25 @@ something other than `main`.
 
 ## Added
 
+* Five new testing layers raise confidence from example-based to
+  property-based: fast-check value properties over the public seams;
+  `otra.check_invariants(queue)`, a read-only oracle that returns
+  violations of the engine's cross-table rules (lost wakeups, lost
+  settlements, claim/terminal/attempt incoherence) instead of describing
+  them in prose; a crash/replay fuzzer that generates random task
+  programs as data plus injected fault schedules, then proves the
+  defining property of the engine on each: fault-free-reference results,
+  exactly one journal row per step, exactly `failures + 1` real
+  executions per step function, exact-once child spawns, and a silent
+  oracle — with fast-check shrinking any failure to a minimal program;
+  a pairwise serializability differential that fires every pair of
+  coordination calls concurrently on identical fixtures and asserts the
+  outcome equals one of the two serial orders (never a deadlock); and a
+  multi-worker chaos harness — three workers, force-expired leases,
+  cancels and kills at random rounds — with the oracle run between every
+  round, not just at quiescence. A nightly workflow soaks the fuzz,
+  chaos and property layers at depths CI cannot afford.
+
 * Wakeups are now LISTEN/NOTIFY-driven. Every app shares one lazy dedicated
   `LISTEN otra_wake` connection; idle workers park on it and wake the moment
   a spawn, event, settlement, cancellation, retry, or completion commits —
@@ -151,6 +170,30 @@ something other than `main`.
 
 ## Fixed
 
+* **A worker whose claim was swept could spin through 100 wasted replays.**
+  `otra.suspend_local` answered "don't park" identically for a settled
+  blocker (replay now) and a stolen claim, and a re-parking replay is often
+  fully memoized — so the zombie never hit an ownership guard and redrove
+  itself until the worker's replay cap threw a spurious operator error,
+  precisely when the system was already degraded. A stolen claim now raises
+  `OT001` (and a killed execution `OT002`) from the park itself, which the
+  driver reports as `lost`/`killed`. Found by the multi-worker chaos harness.
+* **`_backoff` accepted `{"max_s": "NaN"}`.** PostgreSQL sorts `NaN` above
+  every other float8, so the `max_s >= 0` guard passed and a NaN cap was
+  silently reinterpreted as the one-day hard cap; it is now rejected with
+  `OT003` like every other malformed strategy field. Found by fast-check
+  (`base_s` and `factor` were already saved by their upper bounds).
+* **A jsonb-hostile string in a step result was a poison pill.** A `U+0000`
+  or a lone UTF-16 surrogate in any checkpointed value made the journal
+  write fail on every replay, wedging the claim until its lease expired,
+  forever. Step results are now sanitized (hostile code points become
+  U+FFFD) and, as a backstop, a Postgres data error (class 22) from a
+  journal write records a permanent, readable failure instead of escaping.
+  Found by fast-check.
+* **`parseDuration` accepted a long-enough digit string.** 309 nines
+  followed by `"s"` overflowed `Number()` to `Infinity` and sailed through —
+  the exact value the numeric branch refuses. Both branches now reject
+  non-finite results. Found by fast-check.
 * **Cancellation could sit undelivered for a whole backoff.** Requesting a
   cancel now expedites an execution parked on retry backoff, and a failing
   attempt with an undelivered cancel retries immediately. Compensation
