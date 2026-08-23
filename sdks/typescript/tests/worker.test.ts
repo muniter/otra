@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
 import { afterEach, beforeEach, test } from "node:test";
 
+import pg from "pg";
+
 import { createTestEnv, waitFor, type TestEnv } from "./helpers.ts";
 
 let env: TestEnv;
@@ -207,5 +209,126 @@ test("stop() drains in-flight executions gracefully", async () => {
 
   for (const execution of spawns) {
     assert.equal((await app.getExecution(execution))!.status, "completed");
+  }
+});
+
+test("heartbeat FAILURES trip a watchdog: the drive goes lost and ctx.signal aborts", async () => {
+  const { app, pool } = env;
+  const gate = new EventEmitter();
+  let sawAbort = false;
+
+  const task = app.task("db-goes-away", function* (_params: null, ctx) {
+    yield* ctx.run("hang", () => {
+      gate.emit("entered");
+      return new Promise<string>((resolve) => {
+        ctx.signal.addEventListener("abort", () => {
+          sawAbort = true;
+          resolve("aborted");
+        });
+      });
+    });
+    return "unreachable";
+  });
+
+  const execution = await app.spawn(task, null);
+  const worker = app.createWorker({ workerId: "w1", claimSeconds: 1 });
+
+  const entered = once(gate, "entered");
+  const inflight = worker.tick();
+  await entered;
+  // The database "goes away" for heartbeats only: every extendClaim rejects.
+  // Previously .catch(() => {}) swallowed this forever -- the lease silently
+  // expired elsewhere while this drive kept running user code, unsignalled.
+  const realExtend = app.db.extendClaim.bind(app.db);
+  (app.db as { extendClaim: unknown }).extendClaim = () =>
+    Promise.reject(new Error("connection terminated"));
+  try {
+    await inflight; // watchdog: no successful heartbeat for a full lease
+  } finally {
+    (app.db as { extendClaim: unknown }).extendClaim = realExtend;
+  }
+
+  assert.equal(sawAbort, true);
+  // The drive abandoned without writing: it could no longer prove ownership.
+  const { rows } = await pool.query(
+    "select 1 from otra.p_default where root_id = $1 and execution_id = $2 and key = 'hang'",
+    [execution.rootId, execution.executionId],
+  );
+  assert.equal(rows.length, 0);
+});
+
+test("unknown-function defers are jittered deterministically per execution", async () => {
+  const { app, pool } = env;
+  // Two executions of a function this worker does not know (deploy skew).
+  const a = await app.spawn("future-fn", null, { queue: "default" });
+  const b = await app.spawn("future-fn", null, { queue: "default" });
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick(); // defers both
+
+  const { rows } = await pool.query(
+    `select id, extract(epoch from run_after - otra.now()) as delay
+       from otra.x_default where id in ($1, $2) order by id`,
+    [a.executionId, b.executionId],
+  );
+  const delays = rows.map((r: { delay: string }) => Number(r.delay));
+  for (const delay of delays) {
+    assert.ok(delay >= 15 && delay < 30, `delay ${delay} outside [15, 30)`);
+  }
+  // Deterministic per execution: a second defer lands on the same delay...
+  await pool.query(
+    "update otra.x_default set run_after = otra.now() where id in ($1, $2)",
+    [a.executionId, b.executionId],
+  );
+  await worker.tick();
+  const { rows: again } = await pool.query(
+    `select id, extract(epoch from run_after - otra.now()) as delay
+       from otra.x_default where id in ($1, $2) order by id`,
+    [a.executionId, b.executionId],
+  );
+  assert.deepEqual(
+    again.map((r: { delay: string }) => Number(r.delay)),
+    delays,
+  );
+  // ...and (with overwhelming likelihood) two executions spread apart.
+  assert.notEqual(delays[0], delays[1]);
+});
+
+test("app.close() stops started workers before ending the pool", async () => {
+  const { app } = env;
+  const gate = new EventEmitter();
+  let releaseStep: (() => void) | null = null;
+
+  const task = app.task("closing-time", function* (_params: null, ctx) {
+    return yield* ctx.run("slow", async () => {
+      gate.emit("entered");
+      await new Promise<void>((resolve) => {
+        releaseStep = resolve;
+      });
+      return "done";
+    });
+  });
+
+  const execution = await app.spawn(task, null);
+  app.startWorker({ workerId: "w1", pollIntervalMs: 10 });
+
+  await once(gate, "entered");
+  const closing = app.close(); // must stop the worker and DRAIN, not yank the pool
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  releaseStep!();
+  await closing;
+
+  // The in-flight execution finished cleanly instead of dying mid-drive.
+  const verify = new pg.Pool({
+    connectionString: env.connectionString,
+    max: 1,
+  });
+  try {
+    const { rows } = await verify.query(
+      "select status from otra.x_default where id = $1",
+      [execution.executionId],
+    );
+    assert.equal(rows[0].status, "completed");
+  } finally {
+    await verify.end();
   }
 });

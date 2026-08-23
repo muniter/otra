@@ -16,6 +16,8 @@ import {
 import { Worker, type WorkerOptions } from "./worker.ts";
 import {
   ExecutionFailedError,
+  OtraError,
+  TimeoutError,
   type ExecutionRef,
   type ExecutionSnapshot,
   type RegisteredTask,
@@ -65,6 +67,7 @@ export class Otra {
   readonly db: Db;
   private readonly pool: Queryable;
   private readonly ownedPool: pg.Pool | null;
+  private readonly workers = new Set<Worker>();
 
   constructor(options: OtraOptions = {}) {
     this.queue = options.queue ?? "default";
@@ -198,6 +201,16 @@ export class Otra {
   ): Promise<ExecutionRef> {
     const name = typeof task === "string" ? task : task.name;
     const registered = this.registry.get(name);
+    if (registered === undefined && options.queue === undefined) {
+      // A typo'd name would otherwise spawn with SQL defaults onto this
+      // app's queue and cycle in the unknown-function defer loop with zero
+      // diagnostics (absurd's a339dee lesson). An explicit queue marks a
+      // deliberate cross-process spawn of a task registered elsewhere.
+      throw new OtraError(
+        `task "${name}" is not registered on this app; pass { queue } ` +
+          `explicitly to spawn a task registered in another process`,
+      );
+    }
     const spawned = await this.db.spawn(
       name,
       params,
@@ -272,7 +285,17 @@ export class Otra {
   ): Promise<R> {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const pollMs = options.pollMs ?? 25;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new TypeError(`invalid timeoutMs: ${timeoutMs}`);
+    }
+    if (!Number.isFinite(pollMs) || pollMs <= 0) {
+      throw new TypeError(`invalid pollMs: ${pollMs}`);
+    }
     const deadline = Date.now() + timeoutMs;
+    // Exponential backoff from pollMs to a 1s ceiling, clamped to the
+    // remaining budget: a flat 25ms interval against a 30s timeout was up
+    // to 1200 round trips per wait (an absurd lesson, their 7def1b9).
+    let interval = pollMs;
     while (true) {
       const snapshot = await this.db.getExecution(execution);
       const executionId = execution.executionId;
@@ -289,10 +312,16 @@ export class Otra {
           snapshot.error,
         );
       }
-      if (Date.now() >= deadline) {
-        throw new Error(`timed out waiting for execution ${executionId}`);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new TimeoutError(
+          `timed out waiting for execution ${executionId}`,
+        );
       }
-      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(interval, remaining)),
+      );
+      interval = Math.min(interval * 2, 1000);
     }
   }
 
@@ -334,10 +363,12 @@ export class Otra {
 
   /** Create a worker bound to this app's registry (not started). */
   createWorker(options: WorkerOptions = {}): Worker {
-    return new Worker(this.db, this.registry, {
+    const worker = new Worker(this.db, this.registry, {
       queue: this.queue,
       ...options,
     });
+    this.workers.add(worker);
+    return worker;
   }
 
   /** Create and start a polling worker. */
@@ -364,7 +395,15 @@ export class Otra {
     return fs.readFileSync(Otra.schemaPath(), "utf8");
   }
 
+  /**
+   * Stop every worker this app created (draining their in-flight drives)
+   * BEFORE ending an owned pool -- ending the pool first would yank the
+   * connection out from under running executions, stranding their claims
+   * for a full lease timeout (an absurd lesson: their close() drains too).
+   */
   async close(): Promise<void> {
+    await Promise.all([...this.workers].map((worker) => worker.stop()));
+    this.workers.clear();
     await this.ownedPool?.end();
   }
 }

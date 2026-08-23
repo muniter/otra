@@ -58,8 +58,7 @@ const EFFECT_KINDS = {
 type CancelPosition = { key: string } | { await: string[] };
 
 type Resume =
-  | { type: "next"; value: unknown }
-  | { type: "throw"; error: unknown };
+  { type: "next"; value: unknown } | { type: "throw"; error: unknown };
 
 function classifyRetryable(err: unknown, injected: unknown): boolean {
   // An error we injected from a memoized rejection escaped uncaught: the
@@ -231,11 +230,19 @@ export async function driveOnce(
   // kill() lands only at the next guarded write, and a hung step never
   // observes it at all.
   let externalOutcome: DriveOutcome | null = null;
+  // Watchdog on heartbeat FAILURES: an unreachable database means the lease
+  // will expire and be swept elsewhere while this drive keeps running user
+  // code. Once no heartbeat has SUCCEEDED for a full lease, assume the
+  // claim is gone: go lost locally and abort ctx.signal (an absurd lesson;
+  // their fatalOnLeaseTimeout exits the process -- too blunt for a worker
+  // driving other executions, so we abandon just this drive).
+  let lastHeartbeatOkAt = Date.now();
   const heartbeatMs = Math.max((claimSeconds * 1000) / 2, 500);
   const heartbeat = setInterval(() => {
     void db
       .extendClaim(claimed, workerId, claimSeconds)
       .then(async ({ held, cancelRequested }) => {
+        lastHeartbeatOkAt = Date.now();
         if (cancelRequested) markCancelPending();
         if (held || externalOutcome !== null) return;
         let killed = false;
@@ -252,7 +259,17 @@ export async function driveOnce(
             : new Error(`worker ${workerId} lost its claim on ${executionId}`),
         );
       })
-      .catch(() => {});
+      .catch(() => {
+        if (externalOutcome !== null) return;
+        if (Date.now() - lastHeartbeatOkAt >= claimSeconds * 1000) {
+          externalOutcome = { type: "lost" };
+          abort.abort(
+            new Error(
+              `worker ${workerId} could not heartbeat ${executionId} for a full lease; assuming the claim is lost`,
+            ),
+          );
+        }
+      });
   }, heartbeatMs);
   heartbeat.unref?.();
 
@@ -431,6 +448,9 @@ export async function driveOnce(
             const retryable = classifyRetryable(err, null);
             return reportFailedAttempt(serializeError(err), retryable);
           }
+          // The claim vanished (or the watchdog gave up) while fn ran:
+          // abandon instead of checkpointing a result we may not own.
+          if (externalOutcome !== null) return externalOutcome;
           const stored = await db.recordRun(
             claimed,
             workerId,

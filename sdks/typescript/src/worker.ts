@@ -21,6 +21,19 @@ export interface WorkerOptions {
 /** Safety bound on immediate replays after a refused suspension. */
 const MAX_REDRIVES = 100;
 
+const UNKNOWN_TASK_DEFER_BASE_SECONDS = 15;
+const UNKNOWN_TASK_DEFER_JITTER_SECONDS = 15;
+
+/** FNV-1a of the seed, modulo the window: stable jitter, no randomness. */
+function deterministicJitterSeconds(seed: string, window: number): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i++) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash % window;
+}
+
 /**
  * A polling worker.  `tick()` claims and drives one batch (useful for
  * deterministic tests); `start()` polls forever until `stop()`.
@@ -86,8 +99,20 @@ export class Worker {
   ): Promise<DriveOutcome | undefined> {
     const registered = this.registry.get(execution.functionName);
     if (registered === undefined) {
-      // Likely a rolling deploy: another worker knows this function.
-      await this.db.defer(execution, this.workerId, 15);
+      // Likely a rolling deploy: another worker knows this function.  The
+      // delay is jittered DETERMINISTICALLY per execution (absurd's
+      // deferClaimedRun) so a fleet deferring the same batch doesn't
+      // re-collide on the same instant forever, while staying stable per
+      // execution across workers.
+      await this.db.defer(
+        execution,
+        this.workerId,
+        UNKNOWN_TASK_DEFER_BASE_SECONDS +
+          deterministicJitterSeconds(
+            execution.executionId,
+            UNKNOWN_TASK_DEFER_JITTER_SECONDS,
+          ),
+      );
       return undefined;
     }
     try {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 
+import { TimeoutError } from "../src/index.ts";
 import { createTestEnv, type TestEnv } from "./helpers.ts";
 
 let env: TestEnv;
@@ -135,4 +136,36 @@ test("ctx.now() reads the database clock, so the fake clock governs it", async (
   const result = await app.getResult<number>(execution);
   // helpers.ts freezes otra.now() at 2026-01-01T00:00:00Z.
   assert.equal(result, Date.parse("2026-01-01T00:00:00Z"));
+});
+
+test("getResult validates its options and times out with a typed error", async () => {
+  const { app } = env;
+  app.task("never-done", function* (_params: null, ctx) {
+    yield* ctx.sleep("1h");
+    return "later";
+  });
+  const execution = await app.spawn("never-done", null, { queue: "default" });
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick(); // parks
+
+  await assert.rejects(
+    app.getResult(execution, { timeoutMs: 50 }),
+    TimeoutError,
+  );
+  await assert.rejects(
+    app.getResult(execution, { timeoutMs: Number.NaN }),
+    TypeError,
+  );
+  await assert.rejects(app.getResult(execution, { timeoutMs: -1 }), TypeError);
+  await assert.rejects(app.getResult(execution, { pollMs: 0 }), TypeError);
+});
+
+test("spawning an unregistered task name requires an explicit queue", async () => {
+  const { app } = env;
+  // A typo'd name used to spawn silently with SQL defaults and then cycle
+  // in the unknown-function defer loop forever (absurd's a339dee lesson).
+  await assert.rejects(app.spawn("tpyo-task", null), /not registered.*queue/s);
+  // Explicit queue = a deliberate cross-process spawn; allowed.
+  const ok = await app.spawn("tpyo-task", null, { queue: "default" });
+  assert.ok(ok.executionId);
 });

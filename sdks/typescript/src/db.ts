@@ -14,12 +14,7 @@ import {
 export type Queryable = Pick<pg.Pool, "query">;
 
 export type PromiseKind =
-  | "run"
-  | "sleep"
-  | "event"
-  | "child"
-  | "external"
-  | "cancel";
+  "run" | "sleep" | "event" | "child" | "external" | "cancel";
 export type PromiseStatus = "pending" | "resolved" | "rejected";
 
 export interface PromiseRow {
