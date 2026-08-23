@@ -60,13 +60,23 @@ Verified against `otra.spawn_local`:
   `partitioned` queues it is a separate `i_<queue>` table with the key as
   primary key, mapping to `(root_id, execution_id)`. Different queues do not
   share a key space.
-- **The loser gets the winner's address back.** A duplicate call returns the
-  same `ExecutionRef` — `{ queueId, rootId, executionId }` — with no error and
-  no second row. The SQL also returns a `created` boolean, but `app.spawn`
-  currently drops it, so at the SDK level a duplicate is indistinguishable
-  from a first call. If you need to know, compare the returned `executionId`
-  against what you recorded for that slot, or read `otra.spawn_local`
-  directly.
+- **The loser gets the winner's address back, and knows that it lost.** A
+  duplicate call returns the same `ExecutionRef` — `{ queueId, rootId,
+  executionId }` — with no error and no second row, and a `created` flag
+  saying which side of the race it was on: `true` when this call is what put
+  the execution there, `false` when the slot was already taken. That is the
+  difference between logging "scheduled 2026-08-23" and "2026-08-23 already
+  scheduled", and it saves the scheduler from diffing execution ids against
+  its own records to find out:
+
+  ```typescript
+  const { executionId, created } = await app.spawn(
+    "rebuild-search-index",
+    { scheduledFor: slot(now, 24 * 60) },
+    { queue: "jobs", idempotencyKey: key },
+  );
+  if (!created) return;                 // another replica already has this slot
+  ```
 - **The loser's arguments are discarded.** Params, `maxAttempts`,
   `retryStrategy`, `delaySeconds` all come from whichever call won. Do not
   encode anything the run needs into a call that might lose.

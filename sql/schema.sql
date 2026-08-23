@@ -19,12 +19,60 @@
 -- All of the coordination logic lives here, in stored functions; SDKs only
 -- ever call these functions.  This mirrors the philosophy of absurd
 -- (sql/absurd.sql in this repository), from which this file borrows liberally.
+--
+-- Error codes
+-- -----------
+-- Every `raise exception` in this file carries one of the sqlstates below, so
+-- callers can branch on the CONDITION instead of pattern-matching English.
+-- The two exceptions are written down where they occur.
+--
+--   OT001  claim lost.   The worker no longer owns this execution (its lease
+--                        was stolen or expired).  The driver maps it to a
+--                        quiet `lost` outcome; see _assert_owner_local.
+--   OT002  killed.       The execution was killed out from under the worker.
+--                        No compensation may run; the driver abandons.
+--   OT003  invalid argument.  The call is malformed on its face and no change
+--                        of state would make it valid: a bad retry strategy,
+--                        a non-positive claim lease, a nonsense deadline, an
+--                        illegal queue name or policy value, a promise key
+--                        that contradicts the recorded journal.
+--   OT004  not found.    The thing addressed is not there: no such queue, no
+--                        such execution, no such relation.
+--   OT005  precondition failed.  The target exists and the arguments are
+--                        fine, but its current STATE forbids the operation --
+--                        a queue with live executions, a non-empty default
+--                        partition, an execution that is not `failed`.  This
+--                        is the class where "fix the state and call again"
+--                        is the right advice, which is exactly what
+--                        separates it from OT003.
+--   40001  serialization failure.  Postgres's own code, kept because callers
+--                        and connection poolers already know to retry it:
+--                        the idempotent-spawn races in spawn_local.
+--
+-- The TypeScript SDK exposes isClaimLost / isKilled / isNotFound /
+-- isPreconditionFailed over these (sdks/typescript/src/db.ts).
 
 create schema if not exists otra;
 
 ------------------------------------------------------------------------------
 -- meta + test support
 ------------------------------------------------------------------------------
+
+-- The schema release version baked into this SQL file.  During development
+-- this is 'main' and release automation replaces it with the actual tag
+-- (absurd's get_schema_version convention).
+--
+-- There is deliberately NO migrations directory and NO migration validator
+-- yet.  Before the first release nobody is running a schema we have to
+-- preserve, so the cheapest correct answer is to exploit that freedom: the
+-- file is idempotent, and the upgrade procedure is "drop schema otra cascade
+-- and reapply".  Migrations become mandatory the moment this function starts
+-- returning a tag -- that is the point at which an installed version exists
+-- to migrate FROM, and the version this returns is what tells the tooling
+-- which migration chain to run.
+create or replace function otra.schema_version () returns text as $$
+  select 'main'::text;
+$$ language sql immutable;
 
 create table if not exists otra.config (
   key text primary key,
@@ -66,6 +114,10 @@ declare
   i int;
 begin
   if v_ts_ms < 0 or v_ts_ms > 281474976710655 then
+    -- Deliberately uncoded (P0001): not a caller-facing condition at all.
+    -- The clock would have to read before 1970 or after the year 10889 for
+    -- this to fire; it exists so a broken otra.now() surfaces here instead of
+    -- silently truncating into a valid-looking id.
     raise exception 'Timestamp "%" is outside UUIDv7 supported range', otra.now();
   end if;
   for i in 0..5 loop
@@ -108,6 +160,7 @@ declare
   i int;
 begin
   if v_ts_ms < 0 or v_ts_ms > 281474976710655 then
+    -- Uncoded (P0001) for the same reason as uuid_v7's twin assertion above.
     raise exception 'Timestamp "%" is outside UUIDv7 supported range', p_time;
   end if;
   for i in 0..5 loop
@@ -181,7 +234,8 @@ begin
   if new.id is distinct from old.id
      or new.name is distinct from old.name
      or new.storage_mode is distinct from old.storage_mode then
-    raise exception 'queue storage identity is immutable';
+    raise exception 'queue storage identity is immutable'
+      using errcode = 'OT005';
   end if;
   return new;
 end;
@@ -221,10 +275,11 @@ for each row execute function otra._protect_queue_storage_identity();
 create or replace function otra.validate_queue_name (p_name text) returns text as $$
 begin
   if p_name is null or p_name = '' then
-    raise exception 'Queue name must be provided';
+    raise exception 'Queue name must be provided' using errcode = 'OT003';
   end if;
   if octet_length(p_name) > 54 then
-    raise exception 'Queue name "%" is too long (max 54 bytes).', p_name;
+    raise exception 'Queue name "%" is too long (max 54 bytes).', p_name
+      using errcode = 'OT003';
   end if;
   -- Names shaped like our own partition suffixes are refused outright: queue
   -- "orders_202601" would want the table x_orders_202601, which is queue
@@ -234,7 +289,7 @@ begin
   if p_name ~ '_\d{6}$' or p_name ~ '_d$' then
     raise exception
       'Queue name "%" ends in a reserved suffix (_<6-digit ISO week> or _d): it would collide with another queue''s partition names.',
-      p_name;
+      p_name using errcode = 'OT003';
   end if;
   return p_name;
 end;
@@ -275,7 +330,7 @@ begin
     if to_regclass(format('otra.%I', v_relation)) is not null then
       raise exception
         'Queue "%" cannot be created: physical name collision with existing relation "%"',
-        p_name, v_relation using errcode = 'OT003';
+        p_name, v_relation using errcode = 'OT005';
     end if;
   end loop;
 end;
@@ -295,7 +350,8 @@ begin
   select name, storage_mode into v_name, v_mode
     from otra.queues where id = p_queue;
   if v_mode is null then
-    raise exception 'Queue % is not provisioned', p_queue;
+    raise exception 'Queue % is not provisioned', p_queue
+      using errcode = 'OT004';
   end if;
   v_x := 'x_' || v_name;
   v_p := 'p_' || v_name;
@@ -670,10 +726,12 @@ begin
   if p_name is not null then
     select storage_mode into v_mode from otra.queues where name = p_name;
     if v_mode is null then
-      raise exception 'Queue "%" does not exist', p_name;
+      raise exception 'Queue "%" does not exist', p_name
+        using errcode = 'OT004';
     end if;
     if v_mode <> 'partitioned' then
-      raise exception 'Queue "%" is not partitioned', p_name;
+      raise exception 'Queue "%" is not partitioned', p_name
+        using errcode = 'OT005';
     end if;
   end if;
 
@@ -706,7 +764,8 @@ declare
 begin
   p_name := otra.validate_queue_name(p_name);
   if v_mode not in ('unpartitioned', 'partitioned') then
-    raise exception 'Unsupported queue storage mode "%"', p_storage_mode;
+    raise exception 'Unsupported queue storage mode "%"', p_storage_mode
+      using errcode = 'OT003';
   end if;
   insert into otra.queues (name, storage_mode) values (p_name, v_mode)
   on conflict (name) do nothing
@@ -715,7 +774,7 @@ begin
     from otra.queues where name = p_name for update;
   if v_existing_mode <> v_mode then
     raise exception 'Queue "%" already exists with storage mode "%"',
-      p_name, v_existing_mode;
+      p_name, v_existing_mode using errcode = 'OT005';
   end if;
   -- Storage names come from the queue name, so a brand-new queue may find
   -- its relations already taken (by another queue's partition, or by
@@ -757,7 +816,8 @@ begin
    where q.name = p_name
      for update;
   if not found then
-    raise exception 'Queue "%" does not exist', p_name;
+    raise exception 'Queue "%" does not exist', p_name
+      using errcode = 'OT004';
   end if;
   v_x := 'x_' || p_name;
 
@@ -770,7 +830,7 @@ begin
     if v_live > 0 then
       raise exception
         'Queue "%" still has % non-terminal execution(s); pass force to drop it anyway',
-        p_name, v_live using errcode = 'OT003';
+        p_name, v_live using errcode = 'OT005';
     end if;
   end if;
 
@@ -843,7 +903,8 @@ begin
    )
    limit 1;
   if v_unknown is not null then
-    raise exception 'Unknown queue policy key "%"', v_unknown;
+    raise exception 'Unknown queue policy key "%"', v_unknown
+      using errcode = 'OT003';
   end if;
 
   select q.storage_mode, q.default_partition,
@@ -856,7 +917,8 @@ begin
    where q.name = p_name
      for update;
   if not found then
-    raise exception 'Queue "%" does not exist', p_name;
+    raise exception 'Queue "%" does not exist', p_name
+      using errcode = 'OT004';
   end if;
 
   if p_policy ? 'partition_lookahead' then
@@ -883,28 +945,31 @@ begin
   end if;
 
   if v_lookahead < interval '0 seconds' then
-    raise exception 'partition_lookahead must be non-negative';
+    raise exception 'partition_lookahead must be non-negative' using errcode = 'OT003';
   end if;
   if v_lookback < interval '0 seconds' then
-    raise exception 'partition_lookback must be non-negative';
+    raise exception 'partition_lookback must be non-negative' using errcode = 'OT003';
   end if;
   if v_cleanup_ttl < interval '0 seconds' then
-    raise exception 'cleanup_ttl must be non-negative';
+    raise exception 'cleanup_ttl must be non-negative' using errcode = 'OT003';
   end if;
   if v_cleanup_limit < 1 then
-    raise exception 'cleanup_limit must be at least 1';
+    raise exception 'cleanup_limit must be at least 1' using errcode = 'OT003';
   end if;
   if v_detach_mode not in ('none', 'empty') then
-    raise exception 'Unsupported detach mode "%"', v_detach_mode;
+    raise exception 'Unsupported detach mode "%"', v_detach_mode
+      using errcode = 'OT003';
   end if;
   if v_detach_min_age < interval '0 seconds' then
-    raise exception 'detach_min_age must be non-negative';
+    raise exception 'detach_min_age must be non-negative' using errcode = 'OT003';
   end if;
   if v_default_partition not in ('enabled', 'disabled') then
-    raise exception 'Unsupported default_partition mode "%"', v_default_partition;
+    raise exception 'Unsupported default_partition mode "%"', v_default_partition
+      using errcode = 'OT003';
   end if;
   if v_storage_mode <> 'partitioned' and p_policy ? 'default_partition' then
-    raise exception 'default_partition policy is only supported for partitioned queues';
+    raise exception 'default_partition policy is only supported for partitioned queues'
+      using errcode = 'OT005';
   end if;
 
   update otra.queues
@@ -955,7 +1020,7 @@ begin
         if v_has_rows then
           raise exception
             'Cannot disable default_partition for queue "%": default partition "%" is not empty',
-            p_name, v_default;
+            p_name, v_default using errcode = 'OT005';
         end if;
         execute format(
           'alter table otra.%I detach partition otra.%I',
@@ -1001,7 +1066,8 @@ declare
   v_x_attached boolean;
 begin
   if p_name is not null and not exists (select 1 from otra.queues where name = p_name) then
-    raise exception 'Queue "%" does not exist', p_name;
+    raise exception 'Queue "%" does not exist', p_name
+      using errcode = 'OT004';
   end if;
 
   for v_queue in
@@ -1140,6 +1206,76 @@ begin
       return next;
     end loop;
   end loop;
+end;
+$$ language plpgsql;
+
+-- The second half of the operator detach flow (absurd's
+-- drop_detached_partition, sql/absurd.sql:2647): list_detach_candidates says
+-- what is eligible, the operator runs the DETACH itself -- PostgreSQL cannot
+-- run DETACH PARTITION CONCURRENTLY inside a function -- and this drops the
+-- storage afterwards.  absurd's version also unschedules the pg_cron jobs it
+-- paired with each partition; otra has no cron layer, so that half is simply
+-- absent, and this is a one-argument function rather than absurd's polling
+-- job body.
+--
+-- Everything about the call is checked before the DROP, because the argument
+-- is an identifier reaching DDL and the blast radius of getting it wrong is a
+-- table:
+--
+--   1. no schema qualifier -- this function only ever drops relations in the
+--      otra schema, and accepting "public.x" would make that a lie;
+--   2. the relation must exist IN otra (the lookup is scoped to nspname
+--      'otra', which is what enforces gate 1's promise);
+--   3. the name must be shaped like a partition we generate: an x_/p_ prefix
+--      and a _<6-digit ISO week> suffix.  Base tables, indexes, the queue
+--      registry and the _d default partitions (which set_queue_policy owns)
+--      all fail this.  validate_queue_name refuses names ending in
+--      _<6 digits>, so a queue's OWN base table can never take this shape;
+--   4. it must be absent from pg_inherits -- that is, actually detached.
+--      Dropping an attached partition would delete live storage out from
+--      under its parent.
+--
+-- Each gate is its own error: OT003 for a malformed argument, OT004 for a
+-- relation that is not there, OT005 for one that is there but still attached.
+create or replace function otra.drop_detached_partition (p_partition text)
+returns void as $$
+declare
+  v_name text := nullif(trim(coalesce(p_partition, '')), '');
+  v_oid oid;
+  v_attached boolean;
+begin
+  if v_name is null then
+    raise exception 'partition table must be provided' using errcode = 'OT003';
+  end if;
+  if v_name like '%.%' then
+    raise exception
+      'partition "%" must be named without a schema qualifier: drop_detached_partition only ever drops relations in the otra schema',
+      v_name using errcode = 'OT003';
+  end if;
+  if v_name !~ '^[xp]_.+_\d{6}$' then
+    raise exception
+      'relation "%" is not an otra week partition (expected x_<queue>_<6-digit ISO week> or p_<queue>_<6-digit ISO week>)',
+      v_name using errcode = 'OT003';
+  end if;
+
+  select c.oid into v_oid
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+   where n.nspname = 'otra' and c.relname = v_name;
+  if v_oid is null then
+    raise exception 'Relation "otra.%" does not exist', v_name
+      using errcode = 'OT004';
+  end if;
+
+  select exists (select 1 from pg_inherits where inhrelid = v_oid)
+    into v_attached;
+  if v_attached then
+    raise exception
+      'partition "otra.%" is still attached to its parent; detach it before dropping',
+      v_name using errcode = 'OT005';
+  end if;
+
+  execute format('drop table otra.%I', v_name);
 end;
 $$ language plpgsql;
 
@@ -1291,7 +1427,8 @@ begin
    where q.name = p_queue
      for key share;
   if not found then
-    raise exception 'Queue "%" does not exist', p_queue;
+    raise exception 'Queue "%" does not exist', p_queue
+      using errcode = 'OT004';
   end if;
 
   v_x := 'x_' || p_queue;
@@ -1429,7 +1566,8 @@ begin
    where q.name = p_queue
      for key share;
   if not found then
-    raise exception 'Queue "%" does not exist', p_queue;
+    raise exception 'Queue "%" does not exist', p_queue
+      using errcode = 'OT004';
   end if;
   v_x := 'x_' || p_queue;
   v_p := 'p_' || p_queue;
@@ -1575,7 +1713,8 @@ begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
   if not found then
-    raise exception 'Queue % does not exist', p_queue;
+    raise exception 'Queue % does not exist', p_queue
+      using errcode = 'OT004';
   end if;
   v_p := 'p_' || v_name;
   return query execute format(
@@ -1606,7 +1745,8 @@ begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
   if not found then
-    raise exception 'Queue % does not exist', p_queue;
+    raise exception 'Queue % does not exist', p_queue
+      using errcode = 'OT004';
   end if;
   v_x := 'x_' || v_name;
   v_p := 'p_' || v_name;
@@ -1621,7 +1761,7 @@ begin
   ) into v_cancelled using p_root, p_execution;
   if v_cancelled then
     raise exception 'execution % has a delivered cancellation; it can only finalize as cancelled',
-      p_execution;
+      p_execution using errcode = 'OT005';
   end if;
   execute format(
     'update otra.%I
@@ -1633,7 +1773,12 @@ begin
   ) using p_result, p_root, p_execution, p_worker;
   get diagnostics v_updated = row_count;
   if v_updated = 0 then
-    raise exception 'execution % is not running under worker %', p_execution, p_worker;
+    -- OT005, not OT001: OT001 is the driver's quiet "your claim was stolen"
+    -- signal and remapping this raise onto it would silently change the
+    -- driver's outcome for a failed completion.  This stays a loud
+    -- precondition failure until that is a decision of its own.
+    raise exception 'execution % is not running under worker %', p_execution, p_worker
+      using errcode = 'OT005';
   end if;
   perform otra._settle_child_promises_local(
     p_queue, p_root, p_execution, true, p_result, null
@@ -1659,7 +1804,8 @@ begin
   select q.name into v_queue_name
     from otra.queues q where q.id = p_queue for key share;
   if not found then
-    raise exception 'Queue % does not exist', p_queue;
+    raise exception 'Queue % does not exist', p_queue
+      using errcode = 'OT004';
   end if;
   v_x := 'x_' || v_queue_name;
   return query execute format(
@@ -1839,7 +1985,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   perform otra._backoff(v_strategy, 1);
   perform otra._assert_owner_local(p_queue, p_root, p_parent, p_worker);
   v_x := 'x_' || v_name;
@@ -1858,6 +2006,11 @@ begin
     -- The key is occupied by a different kind of journal entry.  Falling
     -- through would surface a bare 23505 from the unique index; say what
     -- actually went wrong instead (a determinism violation at this key).
+    -- OT003, NOT OT005: every OT005 is a condition an operator can clear
+    -- and then re-issue the same call successfully.  A determinism violation
+    -- never is -- the journal is write-once and this key is permanently the
+    -- wrong kind -- so it belongs with the other non-retryable "this call was
+    -- malformed for this execution" errors, not with the transient ones.
     raise exception
       'promise key "%" already exists with kind "%"; spawning a child there would diverge from the recorded history',
       p_key, v_kind using errcode = 'OT003';
@@ -1899,7 +2052,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
@@ -1937,7 +2092,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
@@ -1965,7 +2122,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
@@ -1999,7 +2158,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   v_e := 'e_' || v_name;
   perform pg_advisory_xact_lock(
@@ -2055,7 +2216,9 @@ declare
 begin
   select q.id into v_queue_id from otra.queues q
    where q.name = p_queue for key share;
-  if not found then raise exception 'Queue "%" does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue "%" does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_e := 'e_' || p_queue;
   v_p := 'p_' || p_queue;
   perform pg_advisory_xact_lock(
@@ -2096,7 +2259,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   return query execute format(
     'select p.id, p.key, p.label, p.kind, p.status, p.value, p.error,
@@ -2125,7 +2290,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   v_p := 'p_' || v_name;
   execute format(
@@ -2198,7 +2365,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   execute format(
     'update otra.%I
@@ -2227,7 +2396,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   execute format(
     'update otra.%I
@@ -2255,7 +2426,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
@@ -2415,7 +2588,9 @@ create or replace function otra.fail_attempt_local (
 ) as $$
 begin
   perform 1 from otra.queues q where q.id = p_queue for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   -- Ownership is verified inside _fail_attempt_local, under its ordered
   -- locks (a separate assert-then-lock would acquire the child first and
   -- break the global lock order).
@@ -2436,7 +2611,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   execute format(
     'update otra.%I
@@ -2473,7 +2650,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   execute format(
     'update otra.%I
@@ -2505,7 +2684,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   v_p := 'p_' || v_name;
   -- Snapshot the tree membership unlocked, then take ONE lock statement in
@@ -2610,7 +2791,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   -- Same lock discipline as request_cancel_local: snapshot membership, then
   -- one ascending-id lock statement over the target's parent plus the
@@ -2677,7 +2860,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
@@ -2733,7 +2918,9 @@ declare
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
     for key share;
-  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue % does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || v_name;
   if p_max_attempts is not null and p_max_attempts < 1 then
     raise exception 'max_attempts must be at least 1, got %', p_max_attempts
@@ -2752,17 +2939,17 @@ begin
   ) into v_row using p_root, p_execution;
   if v_row.status is null then
     raise exception 'execution % does not exist in queue "%"',
-      p_execution, v_name using errcode = 'OT003';
+      p_execution, v_name using errcode = 'OT004';
   end if;
   if v_row.parent_id is not null then
     raise exception
       'execution % is a child of %; only a root execution can be retried (its parent has already observed the write-once child promise settle)',
-      p_execution, v_row.parent_id using errcode = 'OT003';
+      p_execution, v_row.parent_id using errcode = 'OT005';
   end if;
   if v_row.status <> 'failed' then
     raise exception
       'execution % is %; only a failed execution can be retried',
-      p_execution, v_row.status using errcode = 'OT003';
+      p_execution, v_row.status using errcode = 'OT005';
   end if;
 
   -- At least one more attempt must exist, or the retry would fail the
@@ -2773,7 +2960,7 @@ begin
   if v_max <= v_row.attempt then
     raise exception
       'max_attempts (%) must be greater than the % attempt(s) already made',
-      v_max, v_row.attempt using errcode = 'OT003';
+      v_max, v_row.attempt using errcode = 'OT005';
   end if;
 
   execute format(
@@ -2789,11 +2976,16 @@ begin
 end;
 $$ language plpgsql;
 
-create or replace function otra.cleanup_local (
+-- One retention batch for ONE queue.  The counts are the contract: a batch
+-- that deleted exactly `limit` roots (or `limit` event facts) SATURATED and
+-- there is more due work waiting, so the caller must run again -- nothing
+-- here loops on its own, deliberately, because an unbounded sweep is one
+-- long transaction holding locks over an arbitrary backlog.
+create or replace function otra._cleanup_queue_local (
   p_queue text,
-  p_ttl interval default null,
-  p_limit int default null
-) returns void as $$
+  p_ttl interval,
+  p_limit int
+) returns table (roots_deleted int, events_deleted int) as $$
 declare
   v_mode text;
   v_ttl interval;
@@ -2808,11 +3000,15 @@ begin
          coalesce(p_limit, q.cleanup_limit)
     into v_mode, v_ttl, v_limit
     from otra.queues q where q.name = p_queue for key share;
-  if not found then raise exception 'Queue "%" does not exist', p_queue; end if;
+  if not found then
+    raise exception 'Queue "%" does not exist', p_queue using errcode = 'OT004';
+  end if;
   v_x := 'x_' || p_queue;
   v_p := 'p_' || p_queue;
   v_e := 'e_' || p_queue;
   v_i := 'i_' || p_queue;
+  roots_deleted := 0;
+  events_deleted := 0;
   execute format(
     'select array_agg(id) from (
        select r.id from otra.%1$I r
@@ -2833,12 +3029,17 @@ begin
     -- BEFORE deleting: the deletes below then only re-take held locks, so
     -- cleanup cannot ABBA against walkers or terminal transitions.  (All
     -- members are terminal -- walkers don't lock terminal rows -- so this
-    -- only ever contends with another cleanup.)
+    -- only ever contends with another cleanup.)  The count comes from the
+    -- SAME statement rather than array_length(v_roots): a concurrent cleanup
+    -- that already took some of these trees leaves them absent under the
+    -- lock, and reporting them as ours would fake saturation.
     execute format(
-      'select 1 from otra.%I where root_id = any ($1)
-        order by root_id, id for update',
+      'with locked as (
+         select root_id, id from otra.%I where root_id = any ($1)
+          order by root_id, id for update
+       ) select count(*) filter (where root_id = id)::int from locked',
       v_x
-    ) using v_roots;
+    ) into roots_deleted using v_roots;
     if v_mode = 'partitioned' then
       execute format('delete from otra.%I where root_id = any ($1)', v_i)
         using v_roots;
@@ -2859,5 +3060,54 @@ begin
      )',
     v_e
   ) using v_ttl, v_limit;
+  get diagnostics events_deleted = row_count;
+  return next;
+end;
+$$ language plpgsql;
+
+-- Retention sweep.  With a queue name, one batch for that queue; with NULL,
+-- one batch for EVERY queue, each under its own stored policy (absurd's
+-- cleanup_all_queues, sql/absurd.sql:2044).  Either way the result is one row
+-- per swept queue carrying what the batch actually deleted.
+--
+-- The counts are not decoration: `p_limit` (or the queue's cleanup_limit)
+-- bounds every batch, so a caller that sees roots_deleted = limit has learned
+-- that the sweep SATURATED and must call again before retention is actually
+-- caught up.  A scheduler that ignores the counts and runs this once a day
+-- will silently fall behind forever on a queue that retires more than
+-- cleanup_limit trees a day.
+--
+-- The return type changed from void, and "create or replace" cannot change a
+-- return type, so the old signature must be dropped first.  The new argument
+-- list happens to be identical to the old one, so on a re-apply this drops
+-- the function it is about to recreate -- harmless, and cheaper than a
+-- version probe here just to skip it.
+drop function if exists otra.cleanup_local (text, interval, int);
+create or replace function otra.cleanup_local (
+  p_queue text default null,
+  p_ttl interval default null,
+  p_limit int default null
+) returns table (queue_name text, roots_deleted int, events_deleted int)
+as $$
+declare
+  v_name text;
+  v_batch record;
+begin
+  if p_queue is not null
+     and not exists (select 1 from otra.queues q where q.name = p_queue) then
+    raise exception 'Queue "%" does not exist', p_queue using errcode = 'OT004';
+  end if;
+  for v_name in
+    select q.name from otra.queues q
+     where p_queue is null or q.name = p_queue
+     order by q.name
+  loop
+    select b.roots_deleted, b.events_deleted into v_batch
+      from otra._cleanup_queue_local(v_name, p_ttl, p_limit) b;
+    queue_name := v_name;
+    roots_deleted := v_batch.roots_deleted;
+    events_deleted := v_batch.events_deleted;
+    return next;
+  end loop;
 end;
 $$ language plpgsql;

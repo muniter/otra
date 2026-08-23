@@ -103,6 +103,21 @@ export interface QueuePolicy extends Required<QueuePolicyOptions> {
   defaultPartition: "enabled" | "disabled";
 }
 
+/**
+ * What one retention batch deleted on one queue.  Both counts are bounded by
+ * the batch limit, which is exactly what makes them worth reading: a
+ * `rootsDeleted` (or `eventsDeleted`) equal to the limit in force means the
+ * sweep SATURATED and there is more due work behind it, so the caller must
+ * run cleanup again rather than wait for the next scheduled tick.
+ */
+export interface CleanupOutcome {
+  queueName: string;
+  /** Terminal execution trees deleted, counted by their root. */
+  rootsDeleted: number;
+  /** Expired event facts deleted. */
+  eventsDeleted: number;
+}
+
 export interface DetachCandidate {
   queueName: string;
   parentTable: string;
@@ -153,12 +168,43 @@ export function isKilled(err: unknown): boolean {
   return (err as { code?: unknown })?.code === "OT002";
 }
 
+/**
+ * True when an error is Postgres sqlstate OT004: the thing addressed is not
+ * there -- a queue name with no queue behind it, a relation that no longer
+ * exists, an execution id that names nothing. Distinct from OT005: nothing
+ * about the caller's state can be fixed by trying again later, the address
+ * itself is wrong (or the target has already been swept away).
+ */
+export function isNotFound(err: unknown): boolean {
+  return (err as { code?: unknown })?.code === "OT004";
+}
+
+/**
+ * True when an error is Postgres sqlstate OT005: the target exists and the
+ * arguments are well formed, but its current state forbids the operation --
+ * a queue with live executions refusing to be dropped, a non-empty default
+ * partition refusing to be disabled, an execution that is not `failed`
+ * refusing to be retried. These are the errors worth surfacing to an
+ * operator, because the same call succeeds once the state changes.
+ */
+export function isPreconditionFailed(err: unknown): boolean {
+  return (err as { code?: unknown })?.code === "OT005";
+}
+
 /** Thin, typed wrapper over the otra.* stored functions. */
 export class Db {
   private readonly client: Queryable;
 
   constructor(client: Queryable) {
     this.client = client;
+  }
+
+  /** The schema version baked into the applied sql/schema.sql. */
+  async schemaVersion(): Promise<string> {
+    const { rows } = await this.client.query(
+      `select otra.schema_version() as version`,
+    );
+    return rows[0].version as string;
   }
 
   async createQueue(
@@ -250,18 +296,27 @@ export class Db {
   }
 
   /**
-   * Delete finished execution trees and expired event facts for one queue.
-   * A null ttl/limit falls back to the queue's own retention policy.
+   * Delete finished execution trees and expired event facts: one batch for
+   * the named queue, or one batch for every queue when `name` is null.  A
+   * null ttl/limit falls back to each queue's own retention policy.  The
+   * returned counts say whether a batch saturated its limit and owes another
+   * pass -- see {@link CleanupOutcome}.
    */
   async cleanup(
-    name: string,
+    name: string | null = null,
     ttl: string | null = null,
     limit: number | null = null,
-  ): Promise<void> {
-    await this.client.query(
-      `select otra.cleanup_local($1, $2::interval, $3::int)`,
+  ): Promise<CleanupOutcome[]> {
+    const { rows } = await this.client.query(
+      `select queue_name, roots_deleted, events_deleted
+         from otra.cleanup_local($1, $2::interval, $3::int)`,
       [name, ttl, limit],
     );
+    return rows.map((row: Record<string, unknown>) => ({
+      queueName: row.queue_name as string,
+      rootsDeleted: row.roots_deleted as number,
+      eventsDeleted: row.events_deleted as number,
+    }));
   }
 
   async listDetachCandidates(name?: string): Promise<DetachCandidate[]> {
@@ -275,6 +330,13 @@ export class Db {
       parentTable: row.parent_table as string,
       partitionTable: row.partition_table as string,
     }));
+  }
+
+  /** Drop one already-detached week partition; see the SQL for the gates. */
+  async dropDetachedPartition(partition: string): Promise<void> {
+    await this.client.query(`select otra.drop_detached_partition($1)`, [
+      partition,
+    ]);
   }
 
   async spawn(
@@ -716,9 +778,9 @@ export class Db {
 
   /**
    * Operator retry of a permanently-failed ROOT execution: resume it in
-   * place, journal and all.  Throws (OT003) for a child, for any status
-   * other than 'failed', and for an attempt budget that leaves nothing to
-   * retry.
+   * place, journal and all.  Throws OT004 (isNotFound) when the execution is
+   * gone, and OT005 (isPreconditionFailed) for a child, for any status other
+   * than 'failed', and for an attempt budget that leaves nothing to retry.
    */
   async retry(
     execution: ExecutionRef,
@@ -727,12 +789,7 @@ export class Db {
     const { rows } = await this.client.query(
       `select execution_id, attempt, max_attempts
          from otra.retry_local($1::uuid, $2::uuid, $3::uuid, $4::int)`,
-      [
-        execution.queueId,
-        execution.rootId,
-        execution.executionId,
-        maxAttempts,
-      ],
+      [execution.queueId, execution.rootId, execution.executionId, maxAttempts],
     );
     return {
       executionId: rows[0].execution_id,

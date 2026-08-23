@@ -7,6 +7,7 @@ import pg from "pg";
 import {
   Db,
   type Queryable,
+  type CleanupOutcome,
   type DetachCandidate,
   type Queue,
   type QueuePolicy,
@@ -114,6 +115,17 @@ export class Otra {
     return { name: options.name };
   }
 
+  /**
+   * The schema version applied to the connected database: `"main"` for an
+   * unreleased build, otherwise the release tag stamped into
+   * `sql/schema.sql`. Until the first release there are no migrations --
+   * upgrading is drop-and-reapply -- so this is purely a "which build is in
+   * this database" handle.
+   */
+  async schemaVersion(): Promise<string> {
+    return this.db.schemaVersion();
+  }
+
   /** Provision a queue, defaulting to this app's queue. */
   async createQueue(
     name = this.queue,
@@ -176,17 +188,28 @@ export class Otra {
   }
 
   /**
-   * Retention sweep for one queue (this app's by default): deletes finished
-   * execution trees whose root settled longer ago than `ttl`, and event facts
-   * older than it. `ttl` is a Postgres interval string ("30 days"), `limit`
+   * Retention sweep: deletes finished execution trees whose root settled
+   * longer ago than `ttl`, and event facts older than it. Naming a queue
+   * sweeps that one; omitting the name sweeps EVERY queue, each under its own
+   * stored policy. `ttl` is a Postgres interval string ("30 days"), `limit`
    * bounds the batch; omitting either uses the queue's own policy. Run it on
    * a schedule -- nothing calls it for you.
+   *
+   * Returns one row per swept queue saying what it deleted. Read them: every
+   * batch is bounded, so `rootsDeleted === limit` means the sweep saturated
+   * its limit and there is more due work behind it -- call again until the
+   * counts come back short, or retention quietly falls further behind on
+   * every tick.
    */
   async cleanup(
-    name = this.queue,
+    name?: string,
     options: CleanupOptions = {},
-  ): Promise<void> {
-    await this.db.cleanup(name, options.ttl ?? null, options.limit ?? null);
+  ): Promise<CleanupOutcome[]> {
+    return this.db.cleanup(
+      name ?? null,
+      options.ttl ?? null,
+      options.limit ?? null,
+    );
   }
 
   /** List old empty partitions eligible for an operator-managed detach. */
@@ -194,12 +217,35 @@ export class Otra {
     return this.db.listDetachCandidates(name);
   }
 
-  /** Spawn a top-level execution; returns its queue-local address immediately. */
+  /**
+   * Drop a week partition you have already detached, completing the detach
+   * flow that {@link listDetachCandidates} starts. The DETACH itself stays
+   * yours to run (PostgreSQL cannot do it concurrently from inside a
+   * function); this only reclaims the storage afterwards.
+   *
+   * Every gate is an error, never a silent no-op: the relation must exist in
+   * the otra schema, be named like a partition otra generates, and actually
+   * be detached. Catch them with `isNotFound` / `isPreconditionFailed`.
+   */
+  async dropDetachedPartition(table: string): Promise<void> {
+    await this.db.dropDetachedPartition(table);
+  }
+
+  /**
+   * Spawn a top-level execution; returns its queue-local address immediately.
+   *
+   * `created` says whether this call is what put the execution there. It is
+   * only ever false for an `idempotencyKey` spawn that lost -- the address
+   * returned is then the winner's, unchanged, and none of this call's
+   * arguments were used. Cron and webhook callers need the distinction to
+   * tell "scheduled" from "already scheduled"; everything else can ignore it,
+   * since the field is additive and existing destructuring is unaffected.
+   */
   async spawn<P, R>(
     task: TaskHandle<P, R> | string,
     params: P,
     options: SpawnOptions = {},
-  ): Promise<ExecutionRef> {
+  ): Promise<ExecutionRef & { created: boolean }> {
     const name = typeof task === "string" ? task : task.name;
     const registered = this.registry.get(name);
     if (registered === undefined && options.queue === undefined) {
@@ -229,6 +275,7 @@ export class Otra {
       queueId: spawned.queueId,
       rootId: spawned.rootId,
       executionId: spawned.executionId,
+      created: spawned.created,
     };
   }
 

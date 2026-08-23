@@ -3,7 +3,7 @@ import { afterEach, beforeEach, test } from "node:test";
 
 import pg from "pg";
 
-import { Otra } from "../src/index.ts";
+import { Otra, isNotFound, isPreconditionFailed } from "../src/index.ts";
 import { createTestEnv, waitFor, type TestEnv } from "./helpers.ts";
 
 let env: TestEnv;
@@ -913,4 +913,197 @@ test("week stepping is DST-proof: partition bounds are contiguous across spring-
   } finally {
     await client.end();
   }
+});
+
+test("cleanup reports what it deleted, so a saturated batch can be re-run", async () => {
+  const { app } = env;
+  await app.createQueue("orders");
+  const task = app.task("receipt", function* (params: { id: number }) {
+    return params.id;
+  });
+  const worker = app.createWorker({ workerId: "w1" });
+
+  await app.spawn(task, { id: 1 });
+  await app.spawn(task, { id: 2 });
+  await worker.drain();
+  await app.emitEvent("stale-fact", { v: 1 });
+  await env.advance(2 * 24 * 60 * 60);
+
+  // limit 1 against two due trees: the counts are the only way a caller can
+  // tell the batch saturated and another pass is owed.
+  assert.deepEqual(await app.cleanup("orders", { ttl: "1 day", limit: 1 }), [
+    { queueName: "orders", rootsDeleted: 1, eventsDeleted: 1 },
+  ]);
+  assert.deepEqual(await app.cleanup("orders", { ttl: "1 day", limit: 1 }), [
+    { queueName: "orders", rootsDeleted: 1, eventsDeleted: 0 },
+  ]);
+  // Drained: zero says stop looping.
+  assert.deepEqual(await app.cleanup("orders", { ttl: "1 day", limit: 1 }), [
+    { queueName: "orders", rootsDeleted: 0, eventsDeleted: 0 },
+  ]);
+});
+
+test("cleanup with no queue sweeps every queue under its own TTL policy", async () => {
+  const { app } = env;
+  await app.createQueue("orders");
+  await app.createQueue("archive");
+  await app.setQueuePolicy("orders", { cleanupTtl: "1 day" });
+  await app.setQueuePolicy("archive", { cleanupTtl: "10 days" });
+
+  const task = app.task("receipt", function* () {
+    return 1;
+  });
+  const inOrders = await app.spawn(task, null, { queue: "orders" });
+  const inArchive = await app.spawn(task, null, { queue: "archive" });
+  await app.createWorker({ workerId: "w1", queue: "orders" }).drain();
+  await app.createWorker({ workerId: "w2", queue: "archive" }).drain();
+
+  await env.advance(2 * 24 * 60 * 60);
+  // Each queue is swept under its OWN policy, not one shared TTL: orders is
+  // due at 1 day, archive is not due until 10.
+  assert.deepEqual(await app.cleanup(), [
+    { queueName: "archive", rootsDeleted: 0, eventsDeleted: 0 },
+    { queueName: "orders", rootsDeleted: 1, eventsDeleted: 0 },
+  ]);
+  assert.equal(await app.getExecution(inOrders), null);
+  assert.notEqual(await app.getExecution(inArchive), null);
+
+  await env.advance(20 * 24 * 60 * 60);
+  assert.deepEqual(await app.cleanup(), [
+    { queueName: "archive", rootsDeleted: 1, eventsDeleted: 0 },
+    { queueName: "orders", rootsDeleted: 0, eventsDeleted: 0 },
+  ]);
+  assert.equal(await app.getExecution(inArchive), null);
+});
+
+test("drops a detached partition, and refuses everything that is not one", async () => {
+  const { app, pool } = env;
+  await app.createQueue("archive", { storageMode: "partitioned" });
+  await app.setQueuePolicy("archive", {
+    detachMode: "empty",
+    detachMinAge: "30 days",
+  });
+  await env.advance(120 * 24 * 60 * 60);
+
+  const exists = async (relation: string): Promise<boolean> => {
+    const { rows } = await pool.query(
+      `select to_regclass(format('otra.%I', $1::text)) is not null as found`,
+      [relation],
+    );
+    return rows[0].found;
+  };
+  const code = (expected: string) => (err: unknown) => {
+    assert.equal((err as { code?: string }).code, expected);
+    return true;
+  };
+
+  const target = (await app.listDetachCandidates("archive")).find((candidate) =>
+    candidate.partitionTable.startsWith("p_archive_"),
+  )!;
+
+  // Still attached: dropping it would take live storage out of the parent.
+  await assert.rejects(
+    app.dropDetachedPartition(target.partitionTable),
+    (err: unknown) => {
+      code("OT005")(err);
+      assert.match((err as Error).message, /still attached/);
+      return true;
+    },
+  );
+
+  await pool.query(
+    `alter table otra."${target.parentTable}"
+       detach partition otra."${target.partitionTable}"`,
+  );
+  await app.dropDetachedPartition(target.partitionTable);
+  assert.equal(await exists(target.partitionTable), false);
+
+  // Gone now: a second drop is a clear not-found, not a silent success.
+  await assert.rejects(
+    app.dropDetachedPartition(target.partitionTable),
+    code("OT004"),
+  );
+
+  // A same-named relation living outside otra is never ours to drop.
+  // if-not-exists: the shared-DSN test mode only resets the otra schema, so
+  // this decoy survives between runs.
+  await pool.query(`create table if not exists public.p_archive_209901 ()`);
+  await assert.rejects(
+    app.dropDetachedPartition("p_archive_209901"),
+    code("OT004"),
+  );
+  await assert.rejects(
+    app.dropDetachedPartition("public.p_archive_209901"),
+    (err: unknown) => {
+      code("OT003")(err);
+      assert.match((err as Error).message, /otra schema/);
+      return true;
+    },
+  );
+  assert.equal(
+    (
+      await pool.query(
+        `select to_regclass('public.p_archive_209901') is not null as found`,
+      )
+    ).rows[0].found,
+    true,
+  );
+
+  // An otra relation that is not partition-shaped: the queue registry itself,
+  // a base table, and a default partition (which set_queue_policy owns).
+  for (const name of ["queues", "x_archive", "x_archive_d"]) {
+    await assert.rejects(app.dropDetachedPartition(name), (err: unknown) => {
+      code("OT003")(err);
+      assert.match((err as Error).message, /partition/);
+      return true;
+    });
+  }
+  assert.equal(await exists("x_archive"), true);
+});
+
+test("the error taxonomy separates not-found from precondition-failed", async () => {
+  const { app } = env;
+  await app.createQueue("orders");
+  const task = app.task("parked", function* (_params: null, ctx) {
+    yield* ctx.sleep("1h");
+  });
+  await app.spawn(task, null);
+
+  // OT005: the queue is right there, but its state forbids the operation.
+  await assert.rejects(app.dropQueue("orders"), (err: unknown) => {
+    assert.equal(isPreconditionFailed(err), true);
+    assert.equal(isNotFound(err), false);
+    return true;
+  });
+
+  // OT004: a different condition entirely -- there is no such queue. Both
+  // used to be undifferentiated P0001 (or, for the drop, an overloaded
+  // OT003), so no caller could branch on them.
+  const missing = (err: unknown): boolean => {
+    assert.equal(isNotFound(err), true);
+    assert.equal(isPreconditionFailed(err), false);
+    return true;
+  };
+  await assert.rejects(app.dropQueue("no-such-queue"), missing);
+  await assert.rejects(app.cleanup("no-such-queue"), missing);
+  await assert.rejects(
+    app.setQueuePolicy("no-such-queue", { cleanupTtl: "1 day" }),
+    missing,
+  );
+  await assert.rejects(app.ensurePartitions("no-such-queue"), missing);
+  // Read-only getters keep answering "nothing", not raising: absence is the
+  // answer to the question they were asked.
+  assert.equal(await app.getQueuePolicy("no-such-queue"), null);
+  assert.equal(await app.getQueue("no-such-queue"), null);
+
+  // Argument validation stays OT003 and is neither of the two.
+  await assert.rejects(
+    app.setQueuePolicy("orders", { cleanupLimit: 0 }),
+    (err: unknown) => {
+      assert.equal((err as { code?: string }).code, "OT003");
+      assert.equal(isNotFound(err), false);
+      assert.equal(isPreconditionFailed(err), false);
+      return true;
+    },
+  );
 });

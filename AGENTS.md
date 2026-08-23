@@ -52,6 +52,13 @@ systems, and the decisions already made so you don't relitigate them.
    `record_run`/`create_sleep`/`create_event_wait`/`create_external`/
    parent-scoped `spawn`. The driver maps these to quiet `lost`/`killed`
    outcomes. A zombie worker must never write into a stolen history.
+   Those two codes are part of a closed taxonomy every `raise exception`
+   in `sql/schema.sql` belongs to — `OT003` invalid argument, `OT004` not
+   found, `OT005` precondition failed, plus Postgres's own `40001` — set
+   out in the "Error codes" block at the top of that file. Adding a raise
+   means picking one of them (or writing down why it stays `P0001`), and
+   the split between OT003 and OT005 is the test: OT003 is malformed on
+   its face, OT005 is well formed but forbidden by current state.
 7. **Events are immutable one-shot facts** per (queue, name): first write
    wins, repeat emits are no-ops, repeat waits return the same fact.
    Recurring signals derive names (`tick:${i}`) or use `ctx.promise`. We
@@ -233,6 +240,11 @@ propagate up, cancellations propagate down the tree"):
 - The schema file is idempotent (`create or replace` + targeted
   `drop function` for signature changes) but there is **no migration story**
   for altering existing tables — `create table if not exists` won't alter.
+  That is deliberate pre-release freedom, written down above
+  `otra.schema_version()` (which reports `'main'` until release automation
+  stamps a tag): the upgrade procedure is drop-and-reapply, and migrations
+  become mandatory the moment a tag exists to migrate from. User-facing
+  changes accumulate under `# Unreleased` in `CHANGELOG.md`.
 - Retained facts expire with `cleanup()`'s TTL; an untimed wait registered
   after expiry parks until a live emit. Untimed external promises park until
   settled or killed.

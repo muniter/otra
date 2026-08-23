@@ -169,3 +169,42 @@ test("spawning an unregistered task name requires an explicit queue", async () =
   const ok = await app.spawn("tpyo-task", null, { queue: "default" });
   assert.ok(ok.executionId);
 });
+
+test("a freshly applied schema reports its development version", async () => {
+  const { app } = env;
+  // The schema file carries its own version marker (absurd's
+  // get_schema_version): 'main' while unreleased, stamped with the tag by
+  // release automation. There are no migrations yet -- see the comment above
+  // otra.schema_version() in sql/schema.sql -- so this is the only version
+  // handle an operator has.
+  assert.equal(await app.schemaVersion(), "main");
+});
+
+test("an idempotent spawn reports whether it created the execution", async () => {
+  const { app } = env;
+  const task = app.task("charge", function* (params: { slot: string }) {
+    return params.slot;
+  });
+
+  const first = await app.spawn(
+    task,
+    { slot: "2026-08-23" },
+    {
+      idempotencyKey: "cron:charge:2026-08-23",
+    },
+  );
+  const second = await app.spawn(
+    task,
+    { slot: "2026-08-23" },
+    {
+      idempotencyKey: "cron:charge:2026-08-23",
+    },
+  );
+
+  // Same address both times -- that part already worked. What a cron or
+  // webhook caller needs on top is to tell a fresh spawn from a dedupe, so
+  // it can log "already scheduled" instead of "scheduled".
+  assert.equal(second.executionId, first.executionId);
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+});

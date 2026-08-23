@@ -12,10 +12,13 @@ export {
   Db,
   isClaimLost,
   isKilled,
+  isNotFound,
+  isPreconditionFailed,
   parsePromiseToken,
   promiseToken,
 } from "./db.ts";
 export type {
+  CleanupOutcome,
   ClaimedExecution,
   DetachCandidate,
   PromiseRow,

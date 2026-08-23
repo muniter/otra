@@ -27,6 +27,14 @@ beforeEach(async () => {
   b = new pg.Client({ connectionString: env.connectionString });
   await a.connect();
   await b.connect();
+  // absurd's tests/test_lock_ordering.py:66 trick: the session that holds
+  // locks open runs the deadlock detector at 100ms instead of the 1s default.
+  // These tests are the ABBA regression net -- if a lock-order change ever
+  // reintroduces a cycle, Postgres reports it a tenth of a second in, so the
+  // suite fails with "deadlock detected" instead of sitting on a full second
+  // of wall clock per contended pair (and, at 3s waitFor budgets, possibly
+  // timing out into a much less legible failure).
+  await a.query("set deadlock_timeout = '100ms'");
   const { rows } = await b.query("select pg_backend_pid() as pid");
   bPid = rows[0].pid;
 });
