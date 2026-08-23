@@ -375,8 +375,9 @@ test("provisions a partitioned queue with its current storage window", async () 
 test("runs an effect-free execution from queue-local storage", async () => {
   const { app, pool } = env;
 
+  // (explicit queue: unregistered names without one are rejected client-side)
   await assert.rejects(
-    app.spawn("missing-queue-task", null),
+    app.spawn("missing-queue-task", null, { queue: "orders" }),
     /Queue "orders" does not exist/,
   );
 
