@@ -247,6 +247,17 @@ Two details worth stealing even if you throw the rest away:
   is still blocked keeps the SQL trivially correct; replay is cheap because
   history injection is a single bulk load.
 
+## Guides
+
+Two operational questions every durable-execution deployment runs into:
+
+- [`docs/replay-compatibility.md`](docs/replay-compatibility.md) — how to
+  change task code while executions are in flight: what replays safely, which
+  edits diverge (loudly or silently), and what to do once one has.
+- [`docs/cron.md`](docs/cron.md) — recurring work without a scheduler
+  primitive: an external scheduler plus slot-derived `idempotencyKey`, and why
+  a durable sleep loop is the wrong shape.
+
 ## Testing
 
 Tests are plain `node:test` against a real Postgres. `make test` starts a

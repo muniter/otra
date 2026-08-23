@@ -69,7 +69,11 @@ systems, and the decisions already made so you don't relitigate them.
     are engine-reserved (`$sleep`, `$event:*`, `$spawn:*`, `$promise`,
     `$cancel`) and `Ctx` REJECTS user-supplied `$`-labels — a user step
     keyed `$cancel` would occupy the cancellation journal and make the
-    execution permanently un-cancellable.
+    execution permanently un-cancellable. What this does and does not catch
+    when task code changes under live executions — and the label/`#N`
+    shifts it cannot see — is written up in
+    `docs/replay-compatibility.md`; keep that doc honest if you touch
+    `checkRecorded` or `keyFor`.
 11. **Cancellation delivery never waits out a backoff** (`request_cancel`
     expedites pending rows; a failing attempt with an undelivered cancel
     retries immediately), **never splits a `ctx.uninterruptible` section**
@@ -199,7 +203,9 @@ propagate up, cancellations propagate down the tree"):
 - **Concept budget**: six concepts (task, execution, durable promise,
   handle, event, queue/worker). Anything new must fit an existing row or
   justify a seventh. No `race` combinator until a real use case (losers keep
-  running — needs a semantics note first).
+  running — needs a semantics note first). **No scheduler primitive** either
+  (absurd's call too): recurring work is an external scheduler plus a
+  slot-derived `idempotencyKey`, documented in `docs/cron.md`.
 
 ## Known backlog (in rough priority order)
 
@@ -212,7 +218,8 @@ propagate up, cancellations propagate down the tree"):
 3. `TaskError` rename/cleanup (watchlist: exists only to mark
    non-retryable; consider `NonRetryableError`).
 4. History growth: no continue-as-new equivalent yet; long-looping tasks
-   replay O(history).
+   replay O(history). `docs/cron.md` tells users to avoid durable sleep
+   loops for exactly this reason — revisit it when continue-as-new lands.
 5. npm publish (the name `otra` was free as of 2026-08).
 
 ## Sharp edges to keep in mind
