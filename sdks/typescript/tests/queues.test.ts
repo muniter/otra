@@ -29,19 +29,16 @@ test("provisions and discovers an unpartitioned queue", async () => {
     { name: "orders", storageMode: "unpartitioned" },
   ]);
 
+  // Physical names derive from the queue NAME, not its UUID: readable in
+  // \dt, pg_stat_user_tables, EXPLAIN and every log line.
   const { rows } = await pool.query(
-    `select count(*)::int as table_count
-       from otra.queues q
-       join pg_class c
-         on c.relname in (
-           'x_' || replace(q.id::text, '-', ''),
-           'p_' || replace(q.id::text, '-', ''),
-           'e_' || replace(q.id::text, '-', '')
-         )
+    `select array_agg(c.relname::text order by c.relname)::text[] as tables
+       from pg_class c
        join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
-      where q.name = 'orders' and c.relkind = 'r'`,
+      where c.relkind = 'r'
+        and c.relname in ('x_orders', 'p_orders', 'e_orders')`,
   );
-  assert.equal(rows[0].table_count, 3);
+  assert.deepEqual(rows[0].tables, ["e_orders", "p_orders", "x_orders"]);
 });
 
 test("concurrent queue provisioning is idempotent", async () => {
@@ -59,40 +56,198 @@ test("concurrent queue provisioning is idempotent", async () => {
 });
 
 test("queue names are quoted identifiers with a bounded byte length", async () => {
-  const { app } = env;
+  const { app, pool } = env;
 
+  // Nothing about the character set is policed: every generated identifier
+  // goes through %I, so spaces, case, non-ASCII and even embedded quotes are
+  // just quoted-identifier material.
   await app.createQueue("Queue Name-1");
   await app.createQueue("pedidos-ñ");
   await app.createQueue(`quoted"queue`);
-  await app.createQueue("q".repeat(57));
+  await app.createQueue("q".repeat(54));
 
   assert.deepEqual(await app.listQueues(), [
     { name: "Queue Name-1", storageMode: "unpartitioned" },
     { name: "pedidos-ñ", storageMode: "unpartitioned" },
-    { name: "q".repeat(57), storageMode: "unpartitioned" },
+    { name: "q".repeat(54), storageMode: "unpartitioned" },
     { name: `quoted"queue`, storageMode: "unpartitioned" },
   ]);
+  const quoted = await pool.query(
+    `select count(*)::int as count
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+      where c.relname in ('x_Queue Name-1', 'x_pedidos-ñ', 'x_quoted"queue')`,
+  );
+  assert.equal(quoted.rows[0].count, 3);
+
+  // The cap is set by the longest identifier we generate: a week partition,
+  // 'x_' + name + '_' + a 6-character tag. At the cap that is exactly 63
+  // bytes, so a partitioned queue named right at the limit must provision.
+  await app.createQueue("p".repeat(54), { storageMode: "partitioned" });
+  const longest = await pool.query(
+    `select max(octet_length(c.relname))::int as widest,
+            (select count(*)::int
+               from pg_inherits i
+               join pg_class child on child.oid = i.inhrelid
+              where i.inhparent = (
+                select c2.oid from pg_class c2
+                  join pg_namespace n2
+                    on n2.oid = c2.relnamespace and n2.nspname = 'otra'
+                 where c2.relname = $2
+              )) as partitions
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+      where c.relname like $1`,
+    [`%${"p".repeat(54)}%`, `x_${"p".repeat(54)}`],
+  );
+  // Exactly at the limit: nothing was silently truncated (truncation would
+  // fold two weeks onto one name and lose a partition).
+  assert.equal(longest.rows[0].widest, 63);
+  assert.equal(longest.rows[0].partitions, 6);
+
   await assert.rejects(app.createQueue(""), /Queue name must be provided/);
   await assert.rejects(
-    app.createQueue("q".repeat(58)),
-    /too long \(max 57 bytes\)/,
+    app.createQueue("q".repeat(55)),
+    /too long \(max 54 bytes\)/,
   );
   await assert.rejects(
-    app.createQueue("ñ".repeat(29)),
-    /too long \(max 57 bytes\)/,
+    app.createQueue("ñ".repeat(28)),
+    /too long \(max 54 bytes\)/,
   );
 });
 
-test("queue names cannot collide with another queue's physical relations", async () => {
-  const { app } = env;
+test("a queue whose name needs quoting still coordinates end to end", async () => {
+  const { app, pool } = env;
 
+  // Storage names are now user-controlled text, so every dynamic statement in
+  // the engine -- spawn, claim, history writes, events, cleanup, partition
+  // maintenance, drop -- has to survive a name that only works quoted.
+  const name = `Weird "Name" ñ`;
+  await app.createQueue(name, { storageMode: "partitioned" });
+  const local = new Otra({ db: pool, queue: name });
+  try {
+    const task = local.task("quoted-task", function* (_params: null, ctx) {
+      yield* ctx.run("step", () => "stepped");
+      return "ok";
+    });
+    const execution = await local.spawn(task, null);
+    await local.createWorker({ workerId: "w1" }).drain();
+    assert.equal(await local.getResult(execution), "ok");
+
+    await local.emitEvent("a-fact", { v: 1 });
+    await local.ensurePartitions(name);
+    await local.cleanup(name, { ttl: "30 days" });
+
+    const { rows } = await pool.query(
+      `select count(*)::int as count
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+        where c.relname = $1`,
+      [`x_${name}`],
+    );
+    assert.equal(rows[0].count, 1);
+  } finally {
+    await local.close();
+  }
+
+  await app.dropQueue(name);
+  assert.equal(await app.getQueue(name), null);
+});
+
+test("queue names cannot collide with another queue's physical relations", async () => {
+  const { app, pool } = env;
+
+  // Name-derived storage makes one hazard the UUID scheme could not have:
+  // a queue whose name reproduces a relation another queue already owns.
+  // Anything already sitting on a name we are about to create is refused,
+  // loudly, instead of being silently adopted by "create table if not exists".
+  await pool.query(`create table otra.x_shipments (probe int)`);
+  await assert.rejects(
+    app.createQueue("shipments"),
+    /physical name collision with existing relation "x_shipments"/,
+  );
+  assert.deepEqual(await app.listQueues(), []);
+
+  // The guard covers index names too (tables and indexes share one pg_class
+  // namespace), but a name that merely looks like an index suffix is fine:
+  // "orders_ri" gets the table x_orders_ri, while "orders"'s index is
+  // xi_orders_ri -- the 'x_' and 'xi_' prefix families can never meet.
   await app.createQueue("orders");
   await app.createQueue("orders_ri");
-
   assert.deepEqual(await app.listQueues(), [
     { name: "orders", storageMode: "unpartitioned" },
     { name: "orders_ri", storageMode: "unpartitioned" },
   ]);
+
+  // Re-provisioning an existing queue stays idempotent: its own relations are
+  // not a collision with itself.
+  await app.createQueue("orders");
+  await app.createQueue("orders_ri");
+  assert.equal((await app.getQueue("orders"))!.storageMode, "unpartitioned");
+});
+
+test("queue names that mimic a generated partition suffix are rejected", async () => {
+  const { app, pool } = env;
+
+  await app.createQueue("orders", { storageMode: "partitioned" });
+  const { rows } = await pool.query(
+    `select c.relname
+       from pg_inherits i
+       join pg_class c on c.oid = i.inhrelid
+       join pg_class p on p.oid = i.inhparent
+      where p.relname = 'x_orders'
+        and pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+      order by c.relname
+      limit 1`,
+  );
+  const partition: string = rows[0].relname;
+  assert.match(partition, /^x_orders_\d{6}$/);
+
+  // "orders_202601" would want the table x_orders_202601 -- which is already
+  // one of "orders"'s week partitions. Reject the whole shape up front rather
+  // than only when the partition happens to exist yet.
+  await assert.rejects(
+    app.createQueue(partition.slice("x_".length)),
+    /reserved suffix/,
+  );
+  await assert.rejects(app.createQueue("foo_202601"), /reserved suffix/);
+  await assert.rejects(app.createQueue("foo_d"), /reserved suffix/);
+  // A partitioned queue's default partition is 'x_<name>_d'.
+  await assert.rejects(app.createQueue("orders_d"), /reserved suffix/);
+
+  // Neighbouring shapes are legal: the suffix is exactly six digits, or "d".
+  await app.createQueue("foo_20260");
+  await app.createQueue("foo_2026011");
+  await app.createQueue("foo_d1");
+  await app.createQueue("foo_dd");
+});
+
+test("a queue name cannot be renamed out from under its storage", async () => {
+  const { app, pool } = env;
+  await app.createQueue("orders");
+
+  // The name IS the storage identity now, so it is immutable in the same way
+  // the id and the storage mode are.
+  await assert.rejects(
+    pool.query(
+      `update otra.queues set name = 'invoices' where name = 'orders'`,
+    ),
+    /queue storage identity is immutable/,
+  );
+  assert.equal((await app.getQueue("orders"))!.name, "orders");
+  const relations = await pool.query(
+    `select count(*)::int as count
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+      where c.relname = 'x_orders'`,
+  );
+  assert.equal(relations.rows[0].count, 1);
+
+  // A no-op update of an unrelated column still passes the guard.
+  await pool.query(
+    `update otra.queues set cleanup_limit = 500 where name = 'orders'`,
+  );
+  assert.equal((await app.getQueuePolicy("orders"))!.cleanupLimit, 500);
 });
 
 test("drops a queue's storage and frees the name for a fresh queue", async () => {
@@ -100,11 +255,9 @@ test("drops a queue's storage and frees the name for a fresh queue", async () =>
   await app.createQueue("orders");
 
   const before = await pool.query(
-    `select id, replace(id::text, '-', '') as storage
-       from otra.queues where name = 'orders'`,
+    `select id from otra.queues where name = 'orders'`,
   );
   const previousId = before.rows[0].id;
-  const previousStorage = before.rows[0].storage;
 
   await app.dropQueue("orders");
 
@@ -113,12 +266,14 @@ test("drops a queue's storage and frees the name for a fresh queue", async () =>
     `select count(*)::int as count
        from pg_class c
        join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
-      where c.relname like $1`,
-    [`%${previousStorage}%`],
+      where c.relname like 'x\\_orders%'
+         or c.relname like 'p\\_orders%'
+         or c.relname like 'e\\_orders%'`,
   );
   assert.equal(relics.rows[0].count, 0);
 
-  // The name is free again, and the new queue gets its own storage identity.
+  // The name is free again -- and because the drop took the physical relations
+  // with it, the recreated queue reuses the same names under a new id.
   await app.createQueue("orders");
   const after = await pool.query(
     `select id from otra.queues where name = 'orders'`,
@@ -136,11 +291,6 @@ test("drops a queue's storage and frees the name for a fresh queue", async () =>
 test("dropping a partitioned queue removes its partitions and side tables", async () => {
   const { app, pool } = env;
   await app.createQueue("archive", { storageMode: "partitioned" });
-  const { rows } = await pool.query(
-    `select replace(id::text, '-', '') as storage
-       from otra.queues where name = 'archive'`,
-  );
-  const storage = rows[0].storage;
 
   await app.dropQueue("archive");
 
@@ -148,8 +298,7 @@ test("dropping a partitioned queue removes its partitions and side tables", asyn
     `select count(*)::int as count
        from pg_class c
        join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
-      where c.relname like $1`,
-    [`%${storage}%`],
+      where c.relname like '%archive%'`,
   );
   assert.equal(relics.rows[0].count, 0);
   assert.deepEqual(await app.listQueues(), []);
@@ -193,29 +342,17 @@ test("provisions a partitioned queue with its current storage window", async () 
   });
 
   const { rows } = await pool.query(
-    `with queue as (
-       select replace(id::text, '-', '') as storage
-         from otra.queues
-        where name = 'archive'
-     ), relations as (
+    `with relations as (
        select c.oid, c.relname, c.relkind
-         from queue q
-         join pg_class c on c.relname in (
-           'x_' || q.storage,
-           'p_' || q.storage,
-           'e_' || q.storage,
-           'i_' || q.storage
-         )
+         from pg_class c
          join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
+        where c.relname in ('x_archive', 'p_archive', 'e_archive', 'i_archive')
      ), children as (
        select parent.relname, count(*)::int as child_count
-         from queue q
-         join pg_class parent on parent.relname in (
-           'x_' || q.storage,
-           'p_' || q.storage
-         )
+         from pg_class parent
          join pg_namespace n on n.oid = parent.relnamespace and n.nspname = 'otra'
          join pg_inherits i on i.inhparent = parent.oid
+        where parent.relname in ('x_archive', 'p_archive')
         group by parent.relname
      )
      select
@@ -279,8 +416,8 @@ test("runs an effect-free execution from queue-local storage", async () => {
     const stored = await pool.query(
       `select
          to_regclass('otra.executions') as shared,
-         format('otra.%I', 'x_' || replace($1::text, '-', ''))::regclass as local_table`,
-      [execution.queueId],
+         format('otra.%I', 'x_' || $1::text)::regclass as local_table`,
+      [queue],
     );
     assert.equal(stored.rows[0].shared, null);
     const localRows = await pool.query(
@@ -307,14 +444,8 @@ test("extends a partitioned queue's storage window", async () => {
 
   const { rows } = await pool.query(
     `select to_regclass(
-       format(
-         'otra.%I',
-         'x_' || replace(q.id::text, '-', '') || '_' ||
-         otra.partition_week_tag(otra.now())
-       )
-     ) is not null as current_week_exists
-       from otra.queues q
-      where q.name = 'archive'`,
+       format('otra.%I', 'x_archive_' || otra.partition_week_tag(otra.now()))
+     ) is not null as current_week_exists`,
   );
   assert.equal(rows[0].current_week_exists, true);
 });
@@ -381,13 +512,9 @@ test("toggles empty default partitions through queue policy", async () => {
   const countDefaults = async (): Promise<number> => {
     const { rows } = await pool.query(
       `select count(*)::int as count
-         from otra.queues q
-         join pg_class c on c.relname in (
-           'x_' || replace(q.id::text, '-', '') || '_d',
-           'p_' || replace(q.id::text, '-', '') || '_d'
-         )
+         from pg_class c
          join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'otra'
-        where q.name = 'archive'`,
+        where c.relname in ('x_archive_d', 'p_archive_d')`,
     );
     return rows[0].count;
   };
@@ -404,13 +531,9 @@ test("refuses to disable a nonempty default partition", async () => {
   await app.createQueue("archive", { storageMode: "partitioned" });
   await env.advance(120 * 24 * 60 * 60);
 
-  const queue = await pool.query(
-    `select 'x_' || replace(id::text, '-', '') as table_name
-       from otra.queues where name = 'archive'`,
-  );
   const id = (await pool.query(`select otra.uuid_v7() as id`)).rows[0].id;
   await pool.query(
-    `insert into otra."${queue.rows[0].table_name}"
+    `insert into otra.x_archive
        (id, root_id, function_name) values ($1, $1, 'out-of-window')`,
     [id],
   );
@@ -430,11 +553,7 @@ test("default maintenance locks parents before default partitions", async () => 
   await app.createQueue("archive", { storageMode: "partitioned" });
   await env.advance(120 * 24 * 60 * 60);
 
-  const { rows } = await pool.query(
-    `select 'x_' || replace(id::text, '-', '') as parent
-       from otra.queues where name = 'archive'`,
-  );
-  const parent = rows[0].parent;
+  const parent = "x_archive";
   const blocker = new pg.Client({ connectionString });
   const maintainer = new pg.Client({ connectionString });
   await blocker.connect();
@@ -513,12 +632,8 @@ test("an orphaned promise partition stays visible after its execution sibling is
   const before = await app.listDetachCandidates("archive");
   assert.equal(before.length, 10);
 
-  const { rows } = await pool.query(
-    `select 'x_' || replace(id::text, '-', '') as x,
-            'p_' || replace(id::text, '-', '') as p
-       from otra.queues where name = 'archive'`,
-  );
-  const { x, p } = rows[0] as { x: string; p: string };
+  const x = "x_archive";
+  const p = "p_archive";
   const tag = before
     .map((candidate) => candidate.partitionTable)
     .find((name) => name.startsWith(`${x}_`))!
@@ -551,13 +666,9 @@ test("keeps a promise generation attached while its execution generation is live
     detachMinAge: "30 days",
   });
 
-  const queue = await pool.query(
-    `select 'x_' || replace(id::text, '-', '') as table_name
-       from otra.queues where name = 'archive'`,
-  );
   const id = (await pool.query(`select otra.uuid_v7() as id`)).rows[0].id;
   await pool.query(
-    `insert into otra."${queue.rows[0].table_name}"
+    `insert into otra.x_archive
        (id, root_id, function_name) values ($1, $1, 'still-live')`,
     [id],
   );
@@ -600,8 +711,7 @@ test("cleanup expires finished trees and event facts past the TTL", async () => 
   };
   const eventNames = async (): Promise<string[]> => {
     const { rows } = await pool.query(
-      `select name from otra.e_${young.queueId.replaceAll("-", "")}
-        order by name`,
+      `select name from otra.e_orders order by name`,
     );
     return rows.map((row: { name: string }) => row.name);
   };
@@ -627,13 +737,8 @@ test("queue tables enforce root ownership and cascade complete trees", async () 
   for (const storageMode of ["unpartitioned", "partitioned"] as const) {
     const name = `tree-${storageMode}`;
     await app.createQueue(name, { storageMode });
-    const queue = await pool.query(
-      `select 'x_' || replace(id::text, '-', '') as executions,
-              'p_' || replace(id::text, '-', '') as promises
-         from otra.queues where name = $1`,
-      [name],
-    );
-    const { executions, promises } = queue.rows[0];
+    const executions = `x_${name}`;
+    const promises = `p_${name}`;
     const ids = (
       await pool.query<{ id: string }>(
         `select otra.uuid_v7() as id from generate_series(1, 4)`,
@@ -710,10 +815,7 @@ test("rows stranded in the default partition are drained when their week partiti
   });
   const execution = await app.spawn("late", null);
 
-  const { rows: q } = await pool.query(
-    "select replace(id::text, '-', '') as s from otra.queues where name = 'orders'",
-  );
-  const x = `x_${q[0].s}`;
+  const x = "x_orders";
   const inDefault = await pool.query(
     `select tableoid::regclass::text as rel from otra.${x} where id = $1`,
     [execution.executionId],
@@ -759,15 +861,12 @@ test("draining the default partition preserves promise history and children", as
 
   await app.ensurePartitions("orders"); // must move the whole tree intact
 
-  const { rows: q } = await pool.query(
-    "select replace(id::text, '-', '') as s from otra.queues where name = 'orders'",
-  );
   const counts = await pool.query(
     `select
-       (select count(*)::int from otra.x_${q[0].s} where root_id = $1) as executions,
-       (select count(*)::int from otra.p_${q[0].s} where root_id = $1) as promises,
-       (select count(*)::int from otra.x_${q[0].s}_d) as x_default,
-       (select count(*)::int from otra.p_${q[0].s}_d) as p_default`,
+       (select count(*)::int from otra.x_orders where root_id = $1) as executions,
+       (select count(*)::int from otra.p_orders where root_id = $1) as promises,
+       (select count(*)::int from otra.x_orders_d) as x_default,
+       (select count(*)::int from otra.p_orders_d) as p_default`,
     [execution.rootId],
   );
   // Parent + child executions; step + child promise rows; default emptied.
@@ -793,8 +892,8 @@ test("week stepping is DST-proof: partition bounds are contiguous across spring-
         from pg_inherits i
         join pg_class c on c.oid = i.inhrelid
         join pg_class p on p.oid = i.inhparent
-        join otra.queues q on p.relname = 'x_' || replace(q.id::text, '-', '')
-       where q.name = 'dst' and pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+       where p.relname = 'x_dst'
+         and pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
        order by c.relname`);
     assert.ok(rows.length >= 4, `expected a full window, got ${rows.length}`);
     const bounds = rows.map((r: { bound: string }) => {

@@ -35,7 +35,7 @@ test("a zombie worker cannot fail an execution it does not own", async () => {
 
   const { rows } = await pool.query(
     `select status, claimed_by, attempt
-       from otra.x_${execution.queueId.replaceAll("-", "")}
+       from otra.x_default
       where root_id = $1 and id = $2`,
     [execution.rootId, execution.executionId],
   );
@@ -63,16 +63,14 @@ test("cleanup deletes finished execution trees and old events", async () => {
   await env.advance(100 * 86400);
   await pool.query("select otra.cleanup_local('default', interval '30 days')");
 
-  const storage = execution.queueId.replaceAll("-", "");
-
   const { rows: executions } = await pool.query(
-    `select count(*)::int as n from otra.x_${storage}`,
+    `select count(*)::int as n from otra.x_default`,
   );
   const { rows: promises } = await pool.query(
-    `select count(*)::int as n from otra.p_${storage}`,
+    `select count(*)::int as n from otra.p_default`,
   );
   const { rows: events } = await pool.query(
-    `select count(*)::int as n from otra.e_${storage}`,
+    `select count(*)::int as n from otra.e_default`,
   );
   assert.equal(executions[0].n, 0);
   assert.equal(promises[0].n, 0);
@@ -104,7 +102,7 @@ test("claiming one queue does not fire another queue's timers", async () => {
   // A worker on queue-a sweeps; queue-b's timer is not its business.
   await pool.query("select * from otra.claim_local('queue-a', 'w2', 30, 5)");
   const { rows: after } = await pool.query(
-    `select status from otra.p_${execution.queue_id.replaceAll("-", "")}
+    `select status from otra."p_queue-b"
       where root_id = $1 and execution_id = $2 and key = 's1'`,
     [execution.root_id, execution.execution_id],
   );
@@ -146,7 +144,7 @@ test("top-level spawns with an idempotency key never duplicate", async () => {
 
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.x_${spawns[0]!.queueId.replaceAll("-", "")}
+       from otra.x_default
       where function_name = 'webhook-handler'`,
   );
   assert.equal(rows[0].n, 1);

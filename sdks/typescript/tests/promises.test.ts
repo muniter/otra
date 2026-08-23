@@ -216,7 +216,7 @@ test("only external promises can be settled from outside", async () => {
 
   // Grab the internal run checkpoint's row id and try to settle it.
   const { rows } = await pool.query(
-    `select id from otra.p_${execution.queueId.replaceAll("-", "")}
+    `select id from otra.p_default
       where root_id = $1 and execution_id = $2 and key = 'step'`,
     [execution.rootId, execution.executionId],
   );
@@ -237,7 +237,7 @@ test("only external promises can be settled from outside", async () => {
 
   // The single-author journal is intact: the run row still holds its value.
   const after = await pool.query(
-    `select kind, status, value from otra.p_${execution.queueId.replaceAll("-", "")}
+    `select kind, status, value from otra.p_default
       where root_id = $1 and id = $2`,
     [execution.rootId, rows[0].id],
   );
@@ -302,7 +302,7 @@ test("spawning a child onto a key held by another promise kind fails loudly", as
 
   // A run checkpoint already occupies the key the child spawn will want.
   await pool.query(
-    `insert into otra.p_${queue_id.replaceAll("-", "")}
+    `insert into otra.p_default
        (root_id, execution_id, key, label, kind, status, value, settled_at)
      values ($1, $2, 'audit', 'audit', 'run', 'resolved', '1'::jsonb, otra.now())`,
     [root_id, execution_id],

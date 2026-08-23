@@ -118,7 +118,7 @@ test("an event name is an immutable fact: repeat waits agree, repeat emits are n
   // Exactly one event row exists for the name.
   const { rows } = await pool.query(
     `select count(*)::int as n, min(payload ->> 'n') as v
-       from otra.e_${execution.queueId.replaceAll("-", "")}
+       from otra.e_default
       where name = 'launched'`,
   );
   assert.equal(rows[0].n, 1);

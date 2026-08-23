@@ -80,7 +80,7 @@ test("cancelling a suspended execution wakes it and delivers at the blocked yiel
   // ran exactly once and was recorded as a promise.
   assert.deepEqual(calls, { forward: 1, compensate: 1 });
   const { rows } = await pool.query(
-    `select status from otra.p_${execution.queueId.replaceAll("-", "")}
+    `select status from otra.p_default
       where root_id = $1 and execution_id = $2 and key = 'compensate'`,
     [execution.rootId, execution.executionId],
   );
@@ -192,7 +192,7 @@ test("a running execution discovers cancellation through the heartbeat", async (
     // The in-flight step finished and was recorded (nobody preempts a local
     // step by default); the next forward step never ran; compensation did.
     const { rows } = await pool.query(
-      `select key, status from otra.p_${execution.queueId.replaceAll("-", "")}
+      `select key, status from otra.p_default
         where root_id = $1 and execution_id = $2 order by key`,
       [execution.rootId, execution.executionId],
     );
@@ -244,7 +244,7 @@ test("kill stops a running execution without compensation (OT002, not OT001)", a
       async () => {
         const { rows } = await pool.query(
           `select count(*)::int as n
-             from otra.x_${execution.queueId.replaceAll("-", "")}
+             from otra.x_default
             where status = 'running'`,
         );
         return rows[0].n === 0;
@@ -254,7 +254,7 @@ test("kill stops a running execution without compensation (OT002, not OT001)", a
 
     const { rows: promises } = await pool.query(
       `select count(*)::int as n
-         from otra.p_${execution.queueId.replaceAll("-", "")}
+         from otra.p_default
         where root_id = $1 and execution_id = $2`,
       [execution.rootId, execution.executionId],
     );
@@ -297,7 +297,7 @@ test("cancel cascades to children by default; detached children survive", async 
   assert.equal(parentSnap.status, "cancelled");
 
   const { app: _, pool } = env;
-  const executions = `otra.x_${execution.queueId.replaceAll("-", "")}`;
+  const executions = `otra.x_default`;
   const { rows } = await pool.query(
     `select function_name, status from ${executions}
       where root_id = $1 and parent_id = $2`,
@@ -344,7 +344,7 @@ test("a cancelled child rejects the parent's await as a cancellation", async () 
 
   const { pool } = env;
   const { rows } = await pool.query(
-    `select id from otra.x_${execution.queueId.replaceAll("-", "")}
+    `select id from otra.x_default
       where root_id = $1 and function_name = 'cancellable-child'`,
     [execution.rootId],
   );
@@ -396,7 +396,7 @@ test("ctx.uninterruptible defers delivery until the critical section exits", asy
   assert.deepEqual(calls, { a: 1, b: 1, outside: 0 });
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.p_${execution.queueId.replaceAll("-", "")}
+       from otra.p_default
       where root_id = $1 and execution_id = $2
         and key in ('critical-a', 'critical-b') and status = 'resolved'`,
     [execution.rootId, execution.executionId],
@@ -450,7 +450,7 @@ test("cancel-vs-suspend race converges in both interleavings", async () => {
     await cancelling;
     let { rows: after } = await pool.query(
       `select status, cancel_requested_at
-         from otra.x_${first.queue_id.replaceAll("-", "")}
+         from otra.x_default
         where root_id = $1 and id = $2`,
       [first.root_id, first.execution_id],
     );
@@ -487,7 +487,7 @@ test("cancel-vs-suspend race converges in both interleavings", async () => {
     assert.equal(parked[0].suspended, false);
     assert.equal(parked[0].cancel_requested, true);
     ({ rows: after } = await pool.query(
-      `select status from otra.x_${second.queue_id.replaceAll("-", "")}
+      `select status from otra."x_race-q2"
         where root_id = $1 and id = $2`,
       [second.root_id, second.execution_id],
     ));
@@ -547,14 +547,9 @@ test("a failed attempt with a pending cancel retries into compensation, then fin
 // --- delivery latency + claim-loss discovery regressions -------------------
 // (found reviewing the queue-local rework; the first two predate it)
 
-/** Resolve the physical table names for a queue (tests only). */
-async function tablesFor(pool: pg.Pool, queue: string) {
-  const { rows } = await pool.query(
-    "select replace(id::text, '-', '') as s from otra.queues where name = $1",
-    [queue],
-  );
-  const s = rows[0].s as string;
-  return { x: `x_${s}`, p: `p_${s}` };
+/** The physical table names for a queue -- derived from its name (tests only). */
+function tablesFor(queue: string) {
+  return { x: `x_${queue}`, p: `p_${queue}` };
 }
 
 test("cancelling an execution parked on retry backoff delivers without waiting it out", async () => {
@@ -585,7 +580,7 @@ test("cancelling an execution parked on retry backoff delivers without waiting i
   const worker = app.createWorker({ workerId: "w1" });
   await worker.tick(); // attempt 1 fails; retry scheduled an hour out
 
-  const { x } = await tablesFor(pool, "default");
+  const { x } = tablesFor("default");
   const before = await pool.query(
     `select status, run_after > otra.now() as parked from otra.${x} where root_id = $1 and id = $2`,
     [execution.rootId, execution.executionId],
@@ -689,7 +684,7 @@ test("kill() aborts ctx.signal mid-step; the hung step unblocks and the drive ab
   const snapshot = (await app.getExecution(execution))!;
   assert.equal(snapshot.status, "cancelled");
   // The zombie write was refused: nothing landed in the journal.
-  const { p } = await tablesFor(pool, "default");
+  const { p } = tablesFor("default");
   const { rows } = await pool.query(
     `select 1 from otra.${p} where root_id = $1 and execution_id = $2 and key = 'hang'`,
     [execution.rootId, execution.executionId],
@@ -726,7 +721,7 @@ test("a stolen claim aborts ctx.signal mid-step and the drive abandons quietly",
   const inflight = worker.tick();
   await entered;
   // Simulate another worker taking over after a lease expiry.
-  const { x, p } = await tablesFor(pool, "default");
+  const { x, p } = tablesFor("default");
   await pool.query(
     `update otra.${x} set claimed_by = 'thief', claim_expires_at = otra.now() + interval '1h' where root_id = $1 and id = $2`,
     [execution.rootId, execution.executionId],

@@ -112,7 +112,7 @@ test("suspend-then-resolve: a child completing against a parking parent still wa
   assert.equal(snapshot.status, "pending");
   const { rows: promise } = await env.pool.query(
     `select status, value
-       from otra.p_${parent.queueId.replaceAll("-", "")}
+       from otra.p_default
       where root_id = $1 and execution_id = $2 and key = 'child-key'`,
     [parent.rootId, parent.executionId],
   );
@@ -156,7 +156,7 @@ test("tree cancellation and child completion share one lock order (no ABBA deadl
     parent.executionId < child.executionId
       ? [parent.executionId, child.executionId]
       : [child.executionId, parent.executionId];
-  const x = `x_${parent.queueId.replaceAll("-", "")}`;
+  const x = "x_default";
 
   // A plays a cancel walk that has acquired the first row and not the rest.
   await a.query("begin");
@@ -187,7 +187,7 @@ test("tree cancellation and child completion share one lock order (no ABBA deadl
 
   assert.equal((await env.app.getExecution(child))!.status, "completed");
   const { rows } = await env.pool.query(
-    `select status from otra.p_${parent.queueId.replaceAll("-", "")}
+    `select status from otra.p_default
       where root_id = $1 and execution_id = $2 and key = 'child-key'`,
     [parent.rootId, parent.executionId],
   );

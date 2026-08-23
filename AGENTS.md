@@ -179,6 +179,23 @@ propagate up, cancellations propagate down the tree"):
 - **Cancellation**: request-flag (`cancel_requested_at`), never a status
   flip; discovery via the heartbeat return; journaled delivery; suspending
   compensation shipped. `kill` is the no-compensation escape hatch.
+- **Queue storage is named after the queue, not its UUID** (`x_orders`,
+  `p_orders`, `x_orders_202601`) — absurd's scheme, chosen for operability:
+  `\dt`, `pg_locks`, autovacuum logs and EXPLAIN all become readable, where
+  `x_019bc186de00…` was opaque. `otra.queues.id` stays as the SDK's
+  routing/token identity (`ExecutionRoute`, promise tokens are unchanged).
+  The price, accepted: queue **names are immutable** —
+  `_protect_queue_storage_identity` refuses renames alongside `id` and
+  `storage_mode`, so renaming means drop-and-recreate — and capped at 54
+  bytes (longest generated identifier is a week partition,
+  `x_<name>_<IYYYIW>` = N + 9 ≤ 63; the arithmetic is in the comment above
+  `validate_queue_name`). Two collision guards, which the UUID scheme did not
+  need: names ending in `_<6 digits>` or `_d` are rejected outright (they
+  would shadow another queue's partitions), and `create_queue` refuses to
+  provision over an existing relation instead of letting
+  `create table if not exists` adopt it. Names are never sanitized — every
+  generated identifier is `%I`-quoted, so spaces, case and non-ASCII are
+  legal. See `docs/queue-storage-design.md`.
 - **Concept budget**: six concepts (task, execution, durable promise,
   handle, event, queue/worker). Anything new must fit an existing row or
   justify a seventh. No `race` combinator until a real use case (losers keep

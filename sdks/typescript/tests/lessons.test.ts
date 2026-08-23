@@ -79,7 +79,7 @@ test("await/emit race cannot lose the wakeup (absurd bcde0df, #61)", async () =>
 
     const { rows } = await pool.query(
       `select status, value
-         from otra.p_${execution.queueId.replaceAll("-", "")}
+         from otra.p_default
         where root_id = $1 and execution_id = $2 and key = 'e1'`,
       [execution.rootId, execution.executionId],
     );
@@ -106,7 +106,7 @@ test("a zombie worker cannot write checkpoints into a stolen history (absurd 2ec
   );
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.p_${execution.queueId.replaceAll("-", "")}
+       from otra.p_default
       where root_id = $1 and execution_id = $2`,
     [execution.rootId, execution.executionId],
   );
@@ -127,7 +127,7 @@ test("a zombie worker cannot spawn children for a stolen parent", async () => {
   );
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.x_${execution.queueId.replaceAll("-", "")}
+       from otra.x_default
       where function_name = 'child-fn'`,
   );
   assert.equal(rows[0].n, 0);
@@ -177,7 +177,7 @@ test("a poisoned legacy retry strategy fails its task without wedging claim()", 
   const execution = await claimedExecution(pool, "w1");
   // Simulate a legacy/corrupt row that predates spawn-time validation.
   await pool.query(
-    `update otra.x_${execution.queueId.replaceAll("-", "")}
+    `update otra.x_default
         set retry_strategy = '{"kind": "exponential", "base_s": "abc"}'::jsonb
       where root_id = $1 and id = $2`,
     [execution.rootId, execution.executionId],
@@ -188,7 +188,7 @@ test("a poisoned legacy retry strategy fails its task without wedging claim()", 
   // a bad strategy fails that task permanently, never blocks the queue).
   await pool.query("select * from otra.claim_local('default', 'w2', 30, 5)");
   const { rows } = await pool.query(
-    `select status from otra.x_${execution.queueId.replaceAll("-", "")}
+    `select status from otra.x_default
       where root_id = $1 and id = $2`,
     [execution.rootId, execution.executionId],
   );
@@ -211,7 +211,7 @@ test("cleanup is bounded by a batch limit", async () => {
   );
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.x_${executions[0]!.queueId.replaceAll("-", "")}`,
+       from otra.x_default`,
   );
   assert.equal(rows[0].n, 3);
 });
@@ -241,7 +241,7 @@ test("cleanup never deletes a tree with live descendants (fire-and-forget child)
   // whole tree must survive until the subtree is terminal.
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.x_${execution.queueId.replaceAll("-", "")}`,
+       from otra.x_default`,
   );
   assert.equal(rows[0].n, 2);
 });

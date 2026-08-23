@@ -80,7 +80,7 @@ test("the concurrency cap holds while slots are saturated", async () => {
 
   const spawns = [];
   for (let i = 1; i <= 5; i++) spawns.push(await app.spawn(task, { id: i }));
-  const executions = `otra.x_${spawns[0]!.queueId.replaceAll("-", "")}`;
+  const executions = `otra.x_default`;
 
   const worker = app.createWorker({
     workerId: "w1",
@@ -135,7 +135,7 @@ test("a freed slot claims new work immediately, not at the next poll", async () 
 
   const spawns = [];
   for (let i = 1; i <= 3; i++) spawns.push(await app.spawn(task, { id: i }));
-  const executions = `otra.x_${spawns[0]!.queueId.replaceAll("-", "")}`;
+  const executions = `otra.x_default`;
 
   // Poll interval of an hour: completion must come from the wake-on-free
   // path, not from polling.

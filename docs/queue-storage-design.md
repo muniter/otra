@@ -108,14 +108,60 @@ Each queue owns three table families:
 ```text
 otra.queues
 
-x_<queue-id>   executions
-p_<queue-id>   durable promises
-e_<queue-id>   immutable event facts
+x_<queue>   executions
+p_<queue>   durable promises
+e_<queue>   immutable event facts
 ```
 
-Queue names are user-facing labels. A stable UUID in `otra.queues` owns the
-physical table names, so valid queue names cannot collide with generated table,
-index, or constraint names. Table and index families use distinct prefixes.
+Physical names are derived from the **queue name**, not from its UUID:
+`x_orders`, `p_orders`, `e_orders`. This follows absurd, and it is an
+operability decision — a queue's storage is identifiable on sight in `\dt`,
+`pg_stat_user_tables`, `pg_locks`, `EXPLAIN` output, autovacuum logs, and bloat
+reports, where `x_019bc186de00…` was opaque. `otra.queues.id` stays: it remains
+the SDK's routing and token identity (`ExecutionRoute`, promise tokens), so no
+SDK surface changes with this scheme.
+
+Three rules keep name-derived storage safe:
+
+1. **Names are quoted, never sanitized.** Every generated identifier goes
+   through `format(... %I ...)`, so spaces, case, non-ASCII and embedded quotes
+   are legal queue names. Only the byte length is capped —
+   `otra.validate_queue_name` limits a name to 54 bytes so the longest
+   identifier we generate (a week partition, `x_<name>_<IYYYIW>` = N + 9) still
+   fits PostgreSQL's 63-byte limit. The arithmetic is spelled out above the
+   function.
+2. **Names are immutable.** The name is now part of the storage identity, so
+   `_protect_queue_storage_identity` refuses to change it, exactly as it
+   refuses to change `id` or `storage_mode`. Renaming a queue means dropping
+   and recreating it. This is the trade-off consciously reversed: the UUID
+   scheme made renaming free and operations opaque; we chose the opposite,
+   following absurd.
+3. **Collisions are refused, not adopted.** A name-derived scheme creates a
+   hazard the UUID scheme could not have: queue `orders_202601` would want the
+   table `x_orders_202601`, which is queue `orders`'s week partition, and
+   `orders_d` its default partition. Two guards close this:
+   - `validate_queue_name` rejects any name ending in our own generated
+     partition suffixes (`_<6 digits>` or `_d`), independent of creation order
+     and of whether the colliding partition exists yet.
+   - `create_queue` checks `to_regclass` for every relation it is about to
+     create — the four base tables *and* the index names, since tables and
+     indexes share one `pg_class` namespace — and raises `physical name
+     collision with existing relation "…"` rather than letting
+     `create table if not exists` silently adopt a stranger's table as a
+     queue's execution store. The check runs only when the `otra.queues` row
+     was just inserted, so re-provisioning an existing queue stays idempotent.
+
+   Base relations can never collide with our index names: `x_` always has its
+   separator at position 2 while `xi_` does not, so the two prefix families are
+   disjoint. That is why `orders` and `orders_ri` are both legal.
+
+   absurd, which has used name-derived storage from the start, ships neither
+   guard: its `validate_queue_name` checks only emptiness and byte length, its
+   `ensure_queue_tables` is plain `create table if not exists`, and the only
+   acknowledgement is a caveat in its `docs/storage.md` about weekly partition
+   tags rolling over every ten years "to avoid partition name collisions". We
+   add the guards because a silently adopted relation is a corrupted queue,
+   not an error.
 
 Execution rows carry both `id` and `root_id`. Root executions set
 `root_id = id` at insertion; children inherit the parent's `root_id` and queue.
@@ -125,13 +171,13 @@ use the same partition bounds.
 Queue-local keys are:
 
 ```text
-x_<queue-id> primary key:        (root_id, id)
-x_<queue-id> parent reference:   (root_id, parent_id) -> (root_id, id)
-p_<queue-id> primary key:        (root_id, id)
-p_<queue-id> owner reference:    (root_id, execution_id) -> (root_id, id)
-p_<queue-id> deterministic key:  unique (root_id, execution_id, key)
-p_<queue-id> child reference:    (root_id, child_execution_id) -> (root_id, id)
-e_<queue-id> immutable fact:     unique (name)
+x_<queue> primary key:        (root_id, id)
+x_<queue> parent reference:   (root_id, parent_id) -> (root_id, id)
+p_<queue> primary key:        (root_id, id)
+p_<queue> owner reference:    (root_id, execution_id) -> (root_id, id)
+p_<queue> deterministic key:  unique (root_id, execution_id, key)
+p_<queue> child reference:    (root_id, child_execution_id) -> (root_id, id)
+e_<queue> immutable fact:     unique (name)
 ```
 
 No foreign key crosses a queue table set or execution tree. PostgreSQL requires
@@ -148,7 +194,7 @@ The design uses these partitioning foundations:
 - primary, unique, and foreign keys include `root_id`
 - queue storage mode is explicit metadata rather than inferred from relations
 
-Partitioned queues can own `i_<queue-id>`, an unpartitioned idempotency-key
+Partitioned queues can own `i_<queue>`, an unpartitioned idempotency-key
 registry. PostgreSQL cannot enforce queue-wide uniqueness for an index that
 omits the `root_id` partition key.
 
@@ -160,15 +206,15 @@ An unpartitioned queue uses ordinary queue-local tables. A partitioned queue
 uses UUIDv7 range partitions based on `root_id`:
 
 ```text
-x_<queue-id>
-├── x_<queue-id>_202601
-├── x_<queue-id>_202602
-└── x_<queue-id>_d
+x_<queue>
+├── x_<queue>_202601
+├── x_<queue>_202602
+└── x_<queue>_d
 
-p_<queue-id>
-├── p_<queue-id>_202601
-├── p_<queue-id>_202602
-└── p_<queue-id>_d
+p_<queue>
+├── p_<queue>_202601
+├── p_<queue>_202602
+└── p_<queue>_d
 ```
 
 Partitioning by each execution's own creation ID would scatter a long-lived
@@ -202,8 +248,8 @@ exist for exactly as long as its execution tree is retained.
 
 The queue-local design requires dynamic SQL for both storage management and
 coordination because stored functions must address queue-specific tables.
-Dynamic identifiers are derived from provisioned queue UUIDs and always passed
-through `%I` formatting.
+Dynamic identifiers are derived from the provisioned queue's (immutable)
+name and always passed through `%I` formatting.
 
 The implementation centralizes table-name derivation and tests provisioning
 races, relation-family collisions, and queue drop behavior. Every dynamic
@@ -217,7 +263,7 @@ partitions.
 
 Dynamic coordination follows absurd's proven identifier/value split:
 
-- derive relation names from the persisted queue UUID
+- derive relation names from the persisted queue name (immutable, %I-quoted)
 - interpolate identifiers only through `format(... %I ...)`
 - bind every UUID, timestamp, worker ID, key, and JSON value through
   `EXECUTE ... USING`
@@ -303,8 +349,13 @@ queue label -> stable queue route   spawn, claim, emit
 queue ID    -> stable queue route   replay, settlement, inspection
 ```
 
-It returns fixed UUID-derived relation names. Coordination functions then build
-one dynamic statement where practical instead of exposing table names to the
+Both seams resolve the same queue row; the ID seam reads `name` from it (under
+the same `FOR KEY SHARE` barrier) and derives the relation names from that.
+Internal helpers that receive only a queue ID (`_wake_local`,
+`_settle_child_promises_local`, `_fail_attempt_local`, `_assert_owner_local`)
+do a plain unlocked `select name` — their callers already hold the barrier, and
+the name cannot change under them. Coordination functions then build one
+dynamic statement where practical instead of exposing table names to the
 TypeScript SDK.
 
 ## Coordination Matrix

@@ -225,8 +225,12 @@ inject memoized results at each `yield`, execute the first unrecorded `run`
 loss during a long step), and park the execution when it blocks on an
 unresolved remote promise.
 
-Each provisioned queue owns an `x_<queue-id>` execution tree, a
-`p_<queue-id>` promise journal, and an `e_<queue-id>` event-fact table.
+Each provisioned queue owns an `x_<queue>` execution tree, a `p_<queue>`
+promise journal, and an `e_<queue>` event-fact table — named after the queue
+(`x_orders`, `p_orders`), so a queue's storage is recognizable on sight in
+`\dt`, `pg_locks` and slow-query logs. The price is that queue names are
+immutable and capped at 54 bytes; see
+[`docs/queue-storage-design.md`](docs/queue-storage-design.md).
 Partitioned queues range-partition executions and promises together by
 `root_id`. States:
 `pending → running → suspended/completed/failed/cancelled`. Retries are

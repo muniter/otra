@@ -35,7 +35,7 @@ test("parent suspends while awaiting a same-queue child, then resumes", async ()
   const parked = (await app.getExecution(execution))!;
   assert.equal(parked.status, "suspended");
 
-  const table = `otra.x_${execution.queueId.replaceAll("-", "")}`;
+  const table = `otra.x_default`;
   const { rows: children } = await pool.query(
     `select id, parent_id, root_id, status from ${table} where function_name = 'double'`,
   );
@@ -102,7 +102,7 @@ test("replay never duplicates children", async () => {
   assert.equal(await app.getResult(execution), 1);
   const { rows } = await pool.query(
     `select count(*)::int as n
-       from otra.x_${execution.queueId.replaceAll("-", "")}
+       from otra.x_default
       where function_name = 'once'`,
   );
   assert.equal(rows[0].n, 1);
@@ -226,11 +226,8 @@ test("ctx.spawn honors the child task's registered retry policy", async () => {
   const worker = app.createWorker({ workerId: "w1" });
   await worker.drain();
 
-  const { rows: q } = await pool.query(
-    "select replace(id::text, '-', '') as s from otra.queues where name = 'default'",
-  );
   const { rows } = await pool.query(
-    `select max_attempts, retry_strategy from otra.x_${q[0].s}
+    `select max_attempts, retry_strategy from otra.x_default
       where root_id = $1 and id <> $2`,
     [execution.rootId, execution.executionId],
   );

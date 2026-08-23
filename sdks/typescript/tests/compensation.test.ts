@@ -59,9 +59,8 @@ test("compensation can call a durable child task and await it", async () => {
   assert.equal(refunds, 1);
 
   // The delivery point is journal, and the compensation is checkpointed.
-  const storage = execution.queueId.replaceAll("-", "");
   const { rows } = await pool.query(
-    `select key, kind, status from otra.p_${storage}
+    `select key, kind, status from otra.p_default
       where root_id = $1 and execution_id = $2 order by key`,
     [execution.rootId, execution.executionId],
   );
@@ -71,7 +70,7 @@ test("compensation can call a durable child task and await it", async () => {
   assert.equal(byKey.get("$cancel"), "cancel");
   assert.ok(byKey.has("log-receipt"));
   const { rows: child } = await pool.query(
-    `select status from otra.x_${storage} where function_name = 'refund'`,
+    `select status from otra.x_default where function_name = 'refund'`,
   );
   assert.equal(child[0].status, "completed");
 });

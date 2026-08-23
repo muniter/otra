@@ -169,10 +169,17 @@ create table if not exists otra.queues (
   )
 );
 
+-- The name is part of the storage identity: every physical relation of a
+-- queue is named after it (x_<name>, p_<name>, its partitions, its indexes),
+-- so renaming the row would orphan the storage it addresses.  Renaming is
+-- therefore refused exactly like changing the id or the storage mode.  This
+-- is the price of readable relation names, paid deliberately (see
+-- docs/queue-storage-design.md): drop and recreate to rename.
 create or replace function otra._protect_queue_storage_identity ()
 returns trigger as $$
 begin
   if new.id is distinct from old.id
+     or new.name is distinct from old.name
      or new.storage_mode is distinct from old.storage_mode then
     raise exception 'queue storage identity is immutable';
   end if;
@@ -189,35 +196,110 @@ for each row execute function otra._protect_queue_storage_identity();
 -- queue provisioning
 ------------------------------------------------------------------------------
 
--- Queue names remain compact routing labels; physical identifiers derive from
--- the queue UUID so labels cannot collide with generated relations.
+-- Queue names appear verbatim inside every generated identifier, so we cap
+-- their UTF-8 byte length such that the LONGEST identifier we build still fits
+-- PostgreSQL's 63-byte limit (absurd caps at 57 for the same reason; their
+-- worst case is r_<queue>_sai, ours is a week partition).  The full census of
+-- generated identifiers, with N = octet_length(name):
+--
+--   base tables      x_/p_/e_/i_ + name                        N + 2
+--   default parts    x_/p_ + name + '_d'                       N + 4
+--   week partitions  x_/p_ + name + '_' + to_char(.,'IYYYIW')  N + 9  <-- max
+--   indexes          xi_ + name + '_ri'/'_pi'/'_ii'            N + 6
+--                    xi_ + name + '_cei'/'_fin'                N + 7
+--                    pi_ + name + '_wi'/'_ei'/'_ci'            N + 6
+--                    ei_ + name + '_ci', ii_ + name + '_ri'    N + 6
+--
+-- N + 9 <= 63  =>  N <= 54.  (Index names PostgreSQL picks for itself -- the
+-- pkey, and the per-partition children of our indexes -- are truncated by the
+-- server, not by us, so they do not bind the cap.  The six-digit ISO week tag
+-- assumes a four-digit ISO year, as absurd's three-digit tag assumes its own
+-- horizon.)
+--
+-- Character set is otherwise delegated to PostgreSQL quoted-identifier rules:
+-- every generated identifier goes through format's %I.
 create or replace function otra.validate_queue_name (p_name text) returns text as $$
 begin
   if p_name is null or p_name = '' then
     raise exception 'Queue name must be provided';
   end if;
-  if octet_length(p_name) > 57 then
-    raise exception 'Queue name "%" is too long (max 57 bytes).', p_name;
+  if octet_length(p_name) > 54 then
+    raise exception 'Queue name "%" is too long (max 54 bytes).', p_name;
+  end if;
+  -- Names shaped like our own partition suffixes are refused outright: queue
+  -- "orders_202601" would want the table x_orders_202601, which is queue
+  -- "orders"'s week partition, and "orders_d" its default partition.  The
+  -- to_regclass guard in create_queue only sees partitions that exist yet;
+  -- this closes the shape for good, in both orders of creation.
+  if p_name ~ '_\d{6}$' or p_name ~ '_d$' then
+    raise exception
+      'Queue name "%" ends in a reserved suffix (_<6-digit ISO week> or _d): it would collide with another queue''s partition names.',
+      p_name;
   end if;
   return p_name;
 end;
 $$ language plpgsql immutable;
 
+-- Every relation create_queue is about to create for p_name.  Used by the
+-- collision guard below; the index names are included because tables and
+-- indexes share one namespace in pg_class.
+create or replace function otra._queue_relation_names (p_name text, p_mode text)
+returns text[] as $$
+  select array_remove(array[
+    'x_' || p_name, 'p_' || p_name, 'e_' || p_name,
+    case when p_mode = 'partitioned' then 'i_' || p_name end,
+    'xi_' || p_name || '_ri', 'xi_' || p_name || '_cei',
+    'xi_' || p_name || '_pi', 'xi_' || p_name || '_fin',
+    case when p_mode = 'unpartitioned' then 'xi_' || p_name || '_ii' end,
+    'pi_' || p_name || '_wi', 'pi_' || p_name || '_ei',
+    'pi_' || p_name || '_ci',
+    'ei_' || p_name || '_ci',
+    case when p_mode = 'partitioned' then 'ii_' || p_name || '_ri' end
+  ], null);
+$$ language sql immutable;
+
+-- Refuse to provision over a relation we do not own.  Name-derived storage
+-- makes this possible where UUID-derived names made it unthinkable, and
+-- "create table if not exists" would otherwise silently adopt a stranger's
+-- table as a queue's execution store.  Called ONLY when the queues row was
+-- just inserted: re-provisioning an existing queue must stay idempotent, and
+-- there its own relations are the ones we would trip over.
+create or replace function otra._assert_no_relation_collision (
+  p_name text, p_mode text
+) returns void as $$
+declare
+  v_relation text;
+begin
+  foreach v_relation in array otra._queue_relation_names(p_name, p_mode) loop
+    if to_regclass(format('otra.%I', v_relation)) is not null then
+      raise exception
+        'Queue "%" cannot be created: physical name collision with existing relation "%"',
+        p_name, v_relation using errcode = 'OT003';
+    end if;
+  end loop;
+end;
+$$ language plpgsql;
+
 drop function if exists otra._ensure_queue_tables (text);
 create or replace function otra._ensure_queue_tables (p_queue uuid) returns void as $$
 declare
-  v_storage text := replace(p_queue::text, '-', '');
-  v_x text := 'x_' || v_storage;
-  v_p text := 'p_' || v_storage;
-  v_e text := 'e_' || v_storage;
-  v_i text := 'i_' || v_storage;
+  v_name text;
+  v_x text;
+  v_p text;
+  v_e text;
+  v_i text;
   v_mode text;
   v_partition_suffix text := '';
 begin
-  select storage_mode into v_mode from otra.queues where id = p_queue;
+  select name, storage_mode into v_name, v_mode
+    from otra.queues where id = p_queue;
   if v_mode is null then
     raise exception 'Queue % is not provisioned', p_queue;
   end if;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
+  v_e := 'e_' || v_name;
+  v_i := 'i_' || v_name;
   if v_mode = 'partitioned' then
     v_partition_suffix := 'partition by range (root_id)';
   end if;
@@ -308,59 +390,59 @@ begin
 
   execute format(
     'create index if not exists %I on otra.%I (run_after) where status = ''pending''',
-    'xi_' || v_storage || '_ri',
+    'xi_' || v_name || '_ri',
     v_x
   );
   execute format(
     'create index if not exists %I on otra.%I (claim_expires_at) where status = ''running''',
-    'xi_' || v_storage || '_cei',
+    'xi_' || v_name || '_cei',
     v_x
   );
   execute format(
     'create index if not exists %I on otra.%I (parent_id) where parent_id is not null',
-    'xi_' || v_storage || '_pi',
+    'xi_' || v_name || '_pi',
     v_x
   );
   if v_mode = 'unpartitioned' then
     execute format(
       'create unique index if not exists %I on otra.%I (idempotency_key) where idempotency_key is not null',
-      'xi_' || v_storage || '_ii',
+      'xi_' || v_name || '_ii',
       v_x
     );
   end if;
   execute format(
     'create index if not exists %I on otra.%I (wake_at) where status = ''pending'' and wake_at is not null',
-    'pi_' || v_storage || '_wi',
+    'pi_' || v_name || '_wi',
     v_p
   );
   execute format(
     'create index if not exists %I on otra.%I (event_name) where status = ''pending'' and kind = ''event''',
-    'pi_' || v_storage || '_ei',
+    'pi_' || v_name || '_ei',
     v_p
   );
   execute format(
     'create index if not exists %I on otra.%I (child_execution_id) where kind = ''child''',
-    'pi_' || v_storage || '_ci',
+    'pi_' || v_name || '_ci',
     v_p
   );
   -- cleanup_local's candidate scan: terminal roots ordered by finished_at.
   execute format(
     'create index if not exists %I on otra.%I (finished_at)
       where root_id = id and status in (''completed'', ''failed'', ''cancelled'')',
-    'xi_' || v_storage || '_fin',
+    'xi_' || v_name || '_fin',
     v_x
   );
   -- cleanup_local's event-TTL batch orders by created_at.
   execute format(
     'create index if not exists %I on otra.%I (created_at)',
-    'ei_' || v_storage || '_ci',
+    'ei_' || v_name || '_ci',
     v_e
   );
   if v_mode = 'partitioned' then
     -- cleanup_local deletes idempotency registrations by root.
     execute format(
       'create index if not exists %I on otra.%I (root_id)',
-      'ii_' || v_storage || '_ri',
+      'ii_' || v_name || '_ri',
       v_i
     );
   end if;
@@ -384,8 +466,8 @@ create or replace function otra._ensure_week_partitions (
 declare
   v_x_part text := p_x || '_' || p_tag;
   v_p_part text := p_p || '_' || p_tag;
-  v_need_x boolean := to_regclass('otra.' || v_x_part) is null;
-  v_need_p boolean := to_regclass('otra.' || v_p_part) is null;
+  v_need_x boolean := to_regclass(format('otra.%I', v_x_part)) is null;
+  v_need_p boolean := to_regclass(format('otra.%I', v_p_part)) is null;
   v_x_d text := p_x || '_d';
   v_p_d text := p_p || '_d';
   v_stranded boolean := false;
@@ -394,13 +476,13 @@ begin
     return;
   end if;
 
-  if to_regclass('otra.' || v_x_d) is not null then
+  if to_regclass(format('otra.%I', v_x_d)) is not null then
     execute format(
       'select exists (select 1 from otra.%I where root_id >= %L::uuid and root_id < %L::uuid)',
       v_x_d, p_lower, p_upper
     ) into v_stranded;
   end if;
-  if not v_stranded and to_regclass('otra.' || v_p_d) is not null then
+  if not v_stranded and to_regclass(format('otra.%I', v_p_d)) is not null then
     execute format(
       'select exists (select 1 from otra.%I where root_id >= %L::uuid and root_id < %L::uuid)',
       v_p_d, p_lower, p_upper
@@ -483,7 +565,6 @@ declare
   v_end timestamptz;
   v_week timestamptz;
   v_next timestamptz;
-  v_storage text;
   v_x text;
   v_p text;
   v_missing boolean := false;
@@ -492,22 +573,21 @@ begin
   if not found or v_row.storage_mode <> 'partitioned' then
     return;
   end if;
-  v_storage := replace(p_queue::text, '-', '');
-  v_x := 'x_' || v_storage;
-  v_p := 'p_' || v_storage;
+  v_x := 'x_' || v_row.name;
+  v_p := 'p_' || v_row.name;
   v_now := otra.now();
   v_start := otra.week_bucket_utc(v_now - v_row.partition_lookback);
   v_end := otra.week_bucket_utc(v_now + v_row.partition_lookahead);
 
   if v_row.default_partition = 'enabled'
-     and (to_regclass('otra.' || v_x || '_d') is null
-          or to_regclass('otra.' || v_p || '_d') is null) then
+     and (to_regclass(format('otra.%I', v_x || '_d')) is null
+          or to_regclass(format('otra.%I', v_p || '_d')) is null) then
     v_missing := true;
   end if;
   v_week := v_start;
   while not v_missing and v_week <= v_end loop
-    if to_regclass('otra.' || v_x || '_' || otra.partition_week_tag(v_week)) is null
-       or to_regclass('otra.' || v_p || '_' || otra.partition_week_tag(v_week)) is null then
+    if to_regclass(format('otra.%I', v_x || '_' || otra.partition_week_tag(v_week))) is null
+       or to_regclass(format('otra.%I', v_p || '_' || otra.partition_week_tag(v_week))) is null then
       v_missing := true;
     end if;
     -- Stepping through week_bucket_utc keeps the walk in UTC: plain
@@ -593,6 +673,7 @@ $$ language plpgsql;
 create or replace function otra.create_queue (p_name text, p_storage_mode text) returns void as $$
 declare
   v_queue uuid;
+  v_created uuid;
   v_mode text := lower(trim(coalesce(p_storage_mode, '')));
   v_existing_mode text;
 begin
@@ -601,12 +682,20 @@ begin
     raise exception 'Unsupported queue storage mode "%"', p_storage_mode;
   end if;
   insert into otra.queues (name, storage_mode) values (p_name, v_mode)
-  on conflict (name) do nothing;
+  on conflict (name) do nothing
+  returning id into v_created;
   select id, storage_mode into strict v_queue, v_existing_mode
     from otra.queues where name = p_name for update;
   if v_existing_mode <> v_mode then
     raise exception 'Queue "%" already exists with storage mode "%"',
       p_name, v_existing_mode;
+  end if;
+  -- Storage names come from the queue name, so a brand-new queue may find
+  -- its relations already taken (by another queue's partition, or by
+  -- something that is not ours at all).  Only a NEW row is checked: a
+  -- re-provision would otherwise trip over the queue's own relations.
+  if v_created is not null then
+    perform otra._assert_no_relation_collision(p_name, v_mode);
   end if;
   perform otra._ensure_queue_tables(v_queue);
   if v_mode = 'partitioned' then
@@ -621,7 +710,7 @@ begin
 end;
 $$ language plpgsql;
 
--- Drop a queue and every physical relation derived from its UUID.  The queue
+-- Drop a queue and every physical relation named after it.  The queue
 -- row is locked FOR UPDATE *before* any DDL: that conflicts with the FOR KEY
 -- SHARE barrier every hot path takes first, so no in-flight spawn/claim can
 -- still be holding resolved table names across the drop.  Non-terminal
@@ -633,7 +722,6 @@ create or replace function otra.drop_queue (
 declare
   v_queue_id uuid;
   v_mode text;
-  v_storage text;
   v_x text;
   v_live int;
 begin
@@ -644,10 +732,9 @@ begin
   if not found then
     raise exception 'Queue "%" does not exist', p_name;
   end if;
-  v_storage := replace(v_queue_id::text, '-', '');
-  v_x := 'x_' || v_storage;
+  v_x := 'x_' || p_name;
 
-  if not p_force and to_regclass('otra.' || v_x) is not null then
+  if not p_force and to_regclass(format('otra.%I', v_x)) is not null then
     execute format(
       'select count(*)::int from otra.%I
         where status not in (''completed'', ''failed'', ''cancelled'')',
@@ -662,11 +749,11 @@ begin
 
   -- Promise storage first: its foreign keys point at the execution table.
   -- CASCADE also takes every attached partition of a partitioned queue.
-  execute format('drop table if exists otra.%I cascade', 'p_' || v_storage);
+  execute format('drop table if exists otra.%I cascade', 'p_' || p_name);
   execute format('drop table if exists otra.%I cascade', v_x);
-  execute format('drop table if exists otra.%I cascade', 'e_' || v_storage);
+  execute format('drop table if exists otra.%I cascade', 'e_' || p_name);
   if v_mode = 'partitioned' then
-    execute format('drop table if exists otra.%I cascade', 'i_' || v_storage);
+    execute format('drop table if exists otra.%I cascade', 'i_' || p_name);
   end if;
 
   delete from otra.queues where id = v_queue_id;
@@ -715,8 +802,6 @@ declare
   v_default_partition text;
   v_previous_default text;
   v_storage_mode text;
-  v_queue_id uuid;
-  v_storage text;
   v_parent text;
   v_default text;
   v_attached boolean;
@@ -734,10 +819,10 @@ begin
     raise exception 'Unknown queue policy key "%"', v_unknown;
   end if;
 
-  select q.id, q.storage_mode, q.default_partition,
+  select q.storage_mode, q.default_partition,
          q.partition_lookahead, q.partition_lookback,
          q.cleanup_ttl, q.cleanup_limit, q.detach_mode, q.detach_min_age
-    into v_queue_id, v_storage_mode, v_default_partition,
+    into v_storage_mode, v_default_partition,
          v_lookahead, v_lookback, v_cleanup_ttl,
          v_cleanup_limit, v_detach_mode, v_detach_min_age
     from otra.queues q
@@ -810,20 +895,19 @@ begin
     if v_default_partition = 'enabled' then
       perform otra.ensure_partitions(p_name);
     else
-      v_storage := replace(v_queue_id::text, '-', '');
       -- Partition maintenance takes parent locks before leaf locks. Queue-local
       -- coordination takes a compatible lock on the queue row before touching
       -- either family, so policy changes form a maintenance barrier.
       execute format(
         'lock table otra.%I in access exclusive mode',
-        'x_' || v_storage
+        'x_' || p_name
       );
       execute format(
         'lock table otra.%I in access exclusive mode',
-        'p_' || v_storage
+        'p_' || p_name
       );
       foreach v_prefix in array array['p', 'x'] loop
-        v_parent := v_prefix || '_' || v_storage;
+        v_parent := v_prefix || '_' || p_name;
         v_default := v_parent || '_d';
         select exists (
           select 1
@@ -888,7 +972,6 @@ declare
   v_p_has_rows boolean;
   v_p_attached boolean;
   v_x_attached boolean;
-  v_storage text;
 begin
   if p_name is not null and not exists (select 1 from otra.queues where name = p_name) then
     raise exception 'Queue "%" does not exist', p_name;
@@ -906,9 +989,8 @@ begin
     -- scan reads the queue's physical layout, so it must not race partition
     -- maintenance (which holds the same row FOR UPDATE while it does DDL).
     perform 1 from otra.queues q where q.id = v_queue.id for key share;
-    v_storage := replace(v_queue.id::text, '-', '');
-    v_x_parent := 'x_' || v_storage;
-    v_p_parent := 'p_' || v_storage;
+    v_x_parent := 'x_' || v_queue.name;
+    v_p_parent := 'p_' || v_queue.name;
     select c.oid into v_x_parent_oid
       from pg_class c
       join pg_namespace n on n.oid = c.relnamespace
@@ -1121,7 +1203,6 @@ create or replace function otra.spawn_local (
 declare
   v_queue_id uuid;
   v_mode text;
-  v_storage text;
   v_x text;
   v_i text;
   v_id uuid := otra.uuid_v7();
@@ -1144,9 +1225,8 @@ begin
     raise exception 'Queue "%" does not exist', p_queue;
   end if;
 
-  v_storage := replace(v_queue_id::text, '-', '');
-  v_x := 'x_' || v_storage;
-  v_i := 'i_' || v_storage;
+  v_x := 'x_' || p_queue;
+  v_i := 'i_' || p_queue;
 
   if v_idempotency_key is not null and v_mode = 'partitioned' then
     execute format(
@@ -1259,7 +1339,6 @@ create or replace function otra.claim_local (
 ) as $$
 declare
   v_queue_id uuid;
-  v_storage text;
   v_x text;
   v_p text;
   v_now timestamptz := otra.now();
@@ -1277,9 +1356,8 @@ begin
   if not found then
     raise exception 'Queue "%" does not exist', p_queue;
   end if;
-  v_storage := replace(v_queue_id::text, '-', '');
-  v_x := 'x_' || v_storage;
-  v_p := 'p_' || v_storage;
+  v_x := 'x_' || p_queue;
+  v_p := 'p_' || p_queue;
 
   for v_woken in execute format(
     'with due as (
@@ -1380,13 +1458,15 @@ create or replace function otra.load_history_local (
   child_execution_id uuid
 ) as $$
 declare
+  v_name text;
   v_p text;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then
     raise exception 'Queue % does not exist', p_queue;
   end if;
-  v_p := 'p_' || replace(p_queue::text, '-', '');
+  v_p := 'p_' || v_name;
   return query execute format(
     'select p.id, p.key, p.label, p.kind, p.status, p.value, p.error,
             p.child_execution_id
@@ -1406,19 +1486,19 @@ create or replace function otra.complete_local (
   p_result jsonb
 ) returns void as $$
 declare
-  v_storage text;
+  v_name text;
   v_x text;
   v_p text;
   v_cancelled boolean;
   v_updated int;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then
     raise exception 'Queue % does not exist', p_queue;
   end if;
-  v_storage := replace(p_queue::text, '-', '');
-  v_x := 'x_' || v_storage;
-  v_p := 'p_' || v_storage;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
   -- Global lock order: self + parent, ascending by id, before any write.
   perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
@@ -1470,7 +1550,7 @@ begin
   if not found then
     raise exception 'Queue % does not exist', p_queue;
   end if;
-  v_x := 'x_' || replace(p_queue::text, '-', '');
+  v_x := 'x_' || v_queue_name;
   return query execute format(
     'select e.id, $1::text, e.function_name, e.status, e.attempt,
             e.params, e.result, e.error, e.parent_id, e.root_id,
@@ -1482,6 +1562,11 @@ begin
 end;
 $$ language plpgsql;
 
+-- Ownership guard.  Resolves the queue's execution table by NAME (storage
+-- identifiers derive from otra.queues.name, which is immutable).  The lookup
+-- is deliberately unlocked: every caller has already taken the queue row FOR
+-- KEY SHARE, which is the barrier that stops partition maintenance and
+-- drop_queue from reshaping this queue's relations underneath us.
 create or replace function otra._assert_owner_local (
   p_queue uuid,
   p_root uuid,
@@ -1489,10 +1574,11 @@ create or replace function otra._assert_owner_local (
   p_worker text
 ) returns void as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_x text;
   v_status text;
   v_claimed_by text;
 begin
+  select 'x_' || q.name into v_x from otra.queues q where q.id = p_queue;
   execute format(
     'select status, claimed_by from otra.%I
       where root_id = $1 and id = $2 for update',
@@ -1538,19 +1624,24 @@ begin
 end;
 $$ language plpgsql;
 
+-- Wake the suspended owners of promises that just settled.  Callers hold
+-- the queue row FOR KEY SHARE, so the unlocked name lookup that resolves the
+-- execution table cannot race partition maintenance or drop_queue.
 create or replace function otra._wake_local (
   p_queue uuid,
   p_root uuid,
   p_execution_ids uuid[]
 ) returns void as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_x text;
   v_woken int;
   v_name text;
 begin
   if p_execution_ids is null or array_length(p_execution_ids, 1) is null then
     return;
   end if;
+  select q.name into v_name from otra.queues q where q.id = p_queue;
+  v_x := 'x_' || v_name;
   execute format(
     'select 1 from otra.%I
       where root_id = $1 and id = any ($2)
@@ -1565,12 +1656,14 @@ begin
   ) using p_root, p_execution_ids;
   get diagnostics v_woken = row_count;
   if v_woken > 0 then
-    select q.name into v_name from otra.queues q where q.id = p_queue;
     perform pg_notify('otra_wake', v_name);
   end if;
 end;
 $$ language plpgsql;
 
+-- Settle the parent-side child promises of a just-finished execution.
+-- Callers hold the queue row FOR KEY SHARE, so the unlocked name lookup that
+-- resolves the promise table cannot race partition maintenance or drop_queue.
 create or replace function otra._settle_child_promises_local (
   p_queue uuid,
   p_root uuid,
@@ -1580,9 +1673,10 @@ create or replace function otra._settle_child_promises_local (
   p_error jsonb
 ) returns void as $$
 declare
-  v_p text := 'p_' || replace(p_queue::text, '-', '');
+  v_p text;
   v_owners uuid[];
 begin
+  select 'p_' || q.name into v_p from otra.queues q where q.id = p_queue;
   execute format(
     'with settled as (
        update otra.%I
@@ -1617,7 +1711,6 @@ create or replace function otra.spawn_child_local (
   created boolean
 ) as $$
 declare
-  v_storage text;
   v_x text;
   v_p text;
   v_existing uuid;
@@ -1630,13 +1723,13 @@ declare
   );
   v_name text;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
   perform otra._backoff(v_strategy, 1);
   perform otra._assert_owner_local(p_queue, p_root, p_parent, p_worker);
-  v_storage := replace(p_queue::text, '-', '');
-  v_x := 'x_' || v_storage;
-  v_p := 'p_' || v_storage;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
   execute format(
     'select kind, child_execution_id from otra.%I
       where root_id = $1 and execution_id = $2 and key = $3',
@@ -1672,7 +1765,6 @@ begin
      values ($1, $2, $3, $4, ''child'', $5)',
     v_p
   ) using p_root, p_parent, p_key, p_label, v_id;
-  select q.name into v_name from otra.queues q where q.id = p_queue;
   perform pg_notify('otra_wake', v_name);
   return query select p_queue, p_root, v_id, true;
 end;
@@ -1684,13 +1776,16 @@ create or replace function otra.record_run_local (
   p_claim_seconds double precision default 30
 ) returns jsonb as $$
 declare
-  v_storage text := replace(p_queue::text, '-', '');
-  v_x text := 'x_' || v_storage;
-  v_p text := 'p_' || v_storage;
+  v_name text;
+  v_x text;
+  v_p text;
   v_value jsonb;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
     'insert into otra.%I
@@ -1720,10 +1815,14 @@ create or replace function otra.create_sleep_local (
   p_queue uuid, p_root uuid, p_execution uuid, p_worker text,
   p_key text, p_label text, p_seconds double precision
 ) returns table (status text, value jsonb, error jsonb) as $$
-declare v_p text := 'p_' || replace(p_queue::text, '-', '');
+declare
+  v_name text;
+  v_p text;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
     'insert into otra.%I
@@ -1744,10 +1843,14 @@ create or replace function otra.create_external_local (
   p_queue uuid, p_root uuid, p_execution uuid, p_worker text,
   p_key text, p_label text, p_timeout_seconds double precision default null
 ) returns table (id uuid, status text, value jsonb, error jsonb) as $$
-declare v_p text := 'p_' || replace(p_queue::text, '-', '');
+declare
+  v_name text;
+  v_p text;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
     'insert into otra.%I
@@ -1772,14 +1875,17 @@ create or replace function otra.create_event_wait_local (
   p_timeout_seconds double precision default null
 ) returns table (status text, value jsonb, error jsonb) as $$
 declare
-  v_storage text := replace(p_queue::text, '-', '');
-  v_p text := 'p_' || v_storage;
-  v_e text := 'e_' || v_storage;
+  v_name text;
+  v_p text;
+  v_e text;
   v_payload jsonb;
   v_count int;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
+  v_e := 'e_' || v_name;
   perform pg_advisory_xact_lock(
     hashtextextended('otra:event:' || p_queue::text || ':' || p_event_name, 0)
   );
@@ -1826,7 +1932,6 @@ create or replace function otra.emit_event_local (
 ) returns boolean as $$
 declare
   v_queue_id uuid;
-  v_storage text;
   v_e text;
   v_p text;
   v_event_id uuid;
@@ -1835,9 +1940,8 @@ begin
   select q.id into v_queue_id from otra.queues q
    where q.name = p_queue for key share;
   if not found then raise exception 'Queue "%" does not exist', p_queue; end if;
-  v_storage := replace(v_queue_id::text, '-', '');
-  v_e := 'e_' || v_storage;
-  v_p := 'p_' || v_storage;
+  v_e := 'e_' || p_queue;
+  v_p := 'p_' || p_queue;
   perform pg_advisory_xact_lock(
     hashtextextended('otra:event:' || v_queue_id::text || ':' || p_name, 0)
   );
@@ -1870,10 +1974,14 @@ create or replace function otra.get_promises_local (
   id uuid, key text, label text, kind text, status text, value jsonb,
   error jsonb, child_execution_id uuid
 ) as $$
-declare v_p text := 'p_' || replace(p_queue::text, '-', '');
+declare
+  v_name text;
+  v_p text;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
   return query execute format(
     'select p.id, p.key, p.label, p.kind, p.status, p.value, p.error,
             p.child_execution_id
@@ -1891,16 +1999,19 @@ create or replace function otra.suspend_local (
   p_shielded boolean default false
 ) returns table (suspended boolean, cancel_requested boolean) as $$
 declare
-  v_storage text := replace(p_queue::text, '-', '');
-  v_x text := 'x_' || v_storage;
-  v_p text := 'p_' || v_storage;
+  v_name text;
+  v_x text;
+  v_p text;
   v_status text;
   v_claimed_by text;
   v_cancel timestamptz;
   v_exists boolean;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
   execute format(
     'select status, claimed_by, cancel_requested_at from otra.%I
       where root_id = $1 and id = $2 for update',
@@ -1965,11 +2076,14 @@ create or replace function otra.resolve_promise_local (
   p_queue uuid, p_root uuid, p_id uuid, p_value jsonb
 ) returns text as $$
 declare
-  v_p text := 'p_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_p text;
   v_owner uuid;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
   execute format(
     'update otra.%I
         set status = ''resolved'', value = $1, settled_at = otra.now()
@@ -1991,11 +2105,14 @@ create or replace function otra.reject_promise_local (
   p_queue uuid, p_root uuid, p_id uuid, p_error jsonb
 ) returns text as $$
 declare
-  v_p text := 'p_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_p text;
   v_owner uuid;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
   execute format(
     'update otra.%I
         set status = ''rejected'', error = $1, settled_at = otra.now()
@@ -2016,11 +2133,14 @@ create or replace function otra.record_cancel_local (
   p_queue uuid, p_root uuid, p_execution uuid, p_worker text, p_position jsonb
 ) returns jsonb as $$
 declare
-  v_p text := 'p_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_p text;
   v_position jsonb;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_p := 'p_' || v_name;
   perform otra._assert_owner_local(p_queue, p_root, p_execution, p_worker);
   execute format(
     'insert into otra.%I
@@ -2038,6 +2158,11 @@ begin
 end;
 $$ language plpgsql;
 
+-- Apply one failed attempt: retry with backoff, or finalize.  Storage names
+-- come from the queue NAME; the lookup is unlocked because both callers
+-- (fail_attempt_local and claim_local's expiry sweep) already hold the queue
+-- row FOR KEY SHARE, the barrier against partition maintenance and
+-- drop_queue.
 drop function if exists otra._fail_attempt_local (uuid, uuid, uuid, jsonb, boolean);
 create or replace function otra._fail_attempt_local (
   p_queue uuid, p_root uuid, p_execution uuid,
@@ -2046,13 +2171,16 @@ create or replace function otra._fail_attempt_local (
   p_only_if_expired boolean default false
 ) returns table (applied boolean, failed_permanently boolean, retry_at timestamptz) as $$
 declare
-  v_storage text := replace(p_queue::text, '-', '');
-  v_x text := 'x_' || v_storage;
-  v_p text := 'p_' || v_storage;
+  v_name text;
+  v_x text;
+  v_p text;
   v_row record;
   v_delivered boolean;
   v_retry_at timestamptz;
 begin
+  select q.name into v_name from otra.queues q where q.id = p_queue;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
   -- Global lock order (self + parent ascending) BEFORE reading state, so a
   -- failure transition can never hold the child while waiting on a walker
   -- that holds the parent.
@@ -2154,11 +2282,14 @@ create or replace function otra.extend_claim_local (
   p_claim_seconds double precision default 30
 ) returns table (held boolean, cancel_requested boolean) as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_x text;
   v_cancel timestamptz;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
   execute format(
     'update otra.%I
         set claim_expires_at = otra.now() + make_interval(secs => $1),
@@ -2188,11 +2319,14 @@ create or replace function otra.defer_local (
   p_delay_seconds double precision default 15
 ) returns boolean as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_x text;
   v_updated int;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
   execute format(
     'update otra.%I
         set status = ''pending'',
@@ -2212,18 +2346,20 @@ create or replace function otra.request_cancel_local (
   p_cascade boolean default true, p_reason text default null
 ) returns table (execution_id uuid, action text) as $$
 declare
-  v_storage text := replace(p_queue::text, '-', '');
-  v_x text := 'x_' || v_storage;
-  v_p text := 'p_' || v_storage;
+  v_name text;
+  v_x text;
+  v_p text;
   v_now timestamptz := otra.now();
   v_row record;
   v_tree uuid[];
   v_parent uuid;
   v_has_history boolean;
-  v_name text;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
+  v_p := 'p_' || v_name;
   -- Snapshot the tree membership unlocked, then take ONE lock statement in
   -- the global ascending-id order: the target's parent (finalizing the
   -- target settles promise rows there and wakes it) plus every non-terminal
@@ -2307,7 +2443,6 @@ begin
       execution_id := v_row.id; action := 'requested'; return next;
     end if;
   end loop;
-  select q.name into v_name from otra.queues q where q.id = p_queue;
   perform pg_notify('otra_wake', v_name);
 end;
 $$ language plpgsql;
@@ -2317,15 +2452,18 @@ create or replace function otra.kill_local (
   p_cascade boolean default true, p_reason text default null
 ) returns int as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_x text;
   v_now timestamptz := otra.now();
   v_row record;
   v_tree uuid[];
   v_parent uuid;
   v_count int := 0;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
   -- Same lock discipline as request_cancel_local: snapshot membership, then
   -- one ascending-id lock statement over the target's parent plus the
   -- non-terminal members.
@@ -2385,11 +2523,14 @@ create or replace function otra.finalize_cancelled_local (
   p_error jsonb default null
 ) returns boolean as $$
 declare
-  v_x text := 'x_' || replace(p_queue::text, '-', '');
+  v_name text;
+  v_x text;
   v_updated int;
 begin
-  perform 1 from otra.queues q where q.id = p_queue for key share;
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
   if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
   perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
     'update otra.%I
@@ -2416,27 +2557,24 @@ create or replace function otra.cleanup_local (
   p_limit int default null
 ) returns void as $$
 declare
-  v_queue_id uuid;
   v_mode text;
   v_ttl interval;
   v_limit int;
-  v_storage text;
   v_x text;
   v_p text;
   v_e text;
   v_i text;
   v_roots uuid[];
 begin
-  select q.id, q.storage_mode, coalesce(p_ttl, q.cleanup_ttl),
+  select q.storage_mode, coalesce(p_ttl, q.cleanup_ttl),
          coalesce(p_limit, q.cleanup_limit)
-    into v_queue_id, v_mode, v_ttl, v_limit
+    into v_mode, v_ttl, v_limit
     from otra.queues q where q.name = p_queue for key share;
   if not found then raise exception 'Queue "%" does not exist', p_queue; end if;
-  v_storage := replace(v_queue_id::text, '-', '');
-  v_x := 'x_' || v_storage;
-  v_p := 'p_' || v_storage;
-  v_e := 'e_' || v_storage;
-  v_i := 'i_' || v_storage;
+  v_x := 'x_' || p_queue;
+  v_p := 'p_' || p_queue;
+  v_e := 'e_' || p_queue;
+  v_i := 'i_' || p_queue;
   execute format(
     'select array_agg(id) from (
        select r.id from otra.%1$I r
