@@ -28,18 +28,30 @@ export function parseDuration(duration: number | string): number {
   if (!match)
     throw new TypeError(`invalid duration: ${JSON.stringify(duration)}`);
   const value = Number(match[1]);
+  let seconds: number;
   switch (match[2]) {
     case "ms":
-      return value / 1000;
+      seconds = value / 1000;
+      break;
     case "s":
-      return value;
+      seconds = value;
+      break;
     case "m":
-      return value * 60;
+      seconds = value * 60;
+      break;
     case "h":
-      return value * 3600;
+      seconds = value * 3600;
+      break;
     default:
-      return value * 86400;
+      seconds = value * 86400;
   }
+  // Totality: a long enough digit run overflows Number() (309 nines, or
+  // 305 with the day multiplier) and would sail through as Infinity --
+  // the exact value the number branch above refuses. Found by fast-check.
+  if (!Number.isFinite(seconds)) {
+    throw new TypeError(`invalid duration: ${JSON.stringify(duration)}`);
+  }
+  return seconds;
 }
 
 function* op<T>(effect: Effect): Op<T> {

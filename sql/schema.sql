@@ -1354,7 +1354,11 @@ begin
     raise exception 'retry_strategy factor must be within [1, 1000]'
       using errcode = 'OT003';
   end if;
-  if not (v_max >= 0) then
+  -- NaN needs an explicit test of its own here: Postgres sorts NaN ABOVE
+  -- every other float8, so 'NaN >= 0' is true, and max_s -- unlike base_s
+  -- and factor -- has no upper bound for NaN to trip on. (NaN = NaN is
+  -- true in Postgres.) Infinity stays legal: it clamps to the cap below.
+  if v_max = 'NaN'::double precision or not (v_max >= 0) then
     raise exception 'retry_strategy max_s must be >= 0'
       using errcode = 'OT003';
   end if;
@@ -2390,9 +2394,20 @@ begin
       where root_id = $1 and id = $2 for update',
     v_x
   ) into v_status, v_claimed_by, v_cancel using p_root, p_execution;
+  -- Raise, don't return a flag: a re-parking replay is often fully memoized,
+  -- so this is the ONLY ownership guard a zombie worker ever reaches.
+  -- Returning (false, false) here made a stolen claim indistinguishable from
+  -- "blocker already settled", and the driver redrove the zombie until the
+  -- worker's replay cap threw a spurious operator error.  Mirrors
+  -- _assert_owner_local: OT002 for killed, OT001 for a lost claim.
+  if v_status = 'cancelled' then
+    raise exception 'execution % was cancelled', p_execution
+      using errcode = 'OT002';
+  end if;
   if v_status is null or v_status <> 'running'
      or v_claimed_by is distinct from p_worker then
-    return query select false, false; return;
+    raise exception 'worker % no longer holds the claim on execution %',
+      p_worker, p_execution using errcode = 'OT001';
   end if;
   execute format(
     'select exists (select 1 from otra.%I

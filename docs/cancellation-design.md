@@ -165,7 +165,13 @@ directly out of the request-flag choice.
 - **Delivery**: `gen.throw(new CancelledError())` (catch-shaped compensation,
   like Temporal TS/Restate — not `gen.return()`, which only reaches
   `finally`), at the first effect requiring *new* work after the memoized
-  fast-forward. Never before the generator starts.
+  fast-forward. Never before the generator starts. A sharp edge that follows:
+  a cancel requested while the execution is parked on its **last** suspension
+  point can race to `'completed'` — once that blocker settles, the replay is
+  fully memoized and no yield needing new work remains to deliver at, so the
+  run finishes with a correct result and `cancel_requested_at` set (never
+  `'failed'`, and never a half-delivered state; the chaos suite pins exactly
+  this contract).
 - **Engine-owned outcome** (closes Temporal's footgun): once delivered, the
   execution finalizes to `'cancelled'` regardless of how the generator ends —
   catch-and-return still yields `'cancelled'`, never `'completed'`, and never

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 
+import { Db, driveOnce, type Ctx, type RegisteredTask } from "../src/index.ts";
 import { createTestEnv, type TestEnv } from "./helpers.ts";
 
 let env: TestEnv;
@@ -42,6 +43,78 @@ test("a zombie worker cannot fail an execution it does not own", async () => {
   assert.equal(rows[0].status, "running");
   assert.equal(rows[0].claimed_by, "worker-live");
   assert.equal(rows[0].attempt, 0);
+});
+
+test("a swept claim surfaces as lost, not an endless redrive", async () => {
+  // Found by the multi-worker chaos harness: when an execution re-parks and
+  // the whole replay path up to the park is memoized (the common case), the
+  // zombie writes nothing, so no ownership guard fires -- and suspend_local's
+  // "blocker already settled" answer used to be indistinguishable from "you
+  // no longer own this row". The driver then redrove the zombie until the
+  // worker's MAX_REDRIVES guard threw a spurious operator error.
+  const { pool } = env;
+  const db = new Db(pool);
+
+  const registered: RegisteredTask = {
+    name: "zombie-parent",
+    *handler(_params: never, ctx: Ctx) {
+      const a = yield* ctx.promise("e1");
+      const b = yield* ctx.promise("e2");
+      return yield* ctx.all([a, b]);
+    },
+  };
+
+  // Build the parked state through raw SQL so the journal is exactly what a
+  // first drive would have written: two externals, parked on both.
+  const { rows: sp } = await pool.query(
+    `select queue_id, root_id, execution_id
+       from otra.spawn_local('zombie-parent', 'null'::jsonb, 'default')`,
+  );
+  const {
+    queue_id: queueId,
+    root_id: rootId,
+    execution_id: executionId,
+  } = sp[0];
+  await pool.query("select * from otra.claim_local('default', 'wp', 3600, 1)");
+  const { rows: e1 } = await pool.query(
+    `select id from otra.create_external_local(
+       $1::uuid, $2::uuid, $3::uuid, 'wp', 'e1', 'e1')`,
+    [queueId, rootId, executionId],
+  );
+  await pool.query(
+    `select * from otra.create_external_local(
+       $1::uuid, $2::uuid, $3::uuid, 'wp', 'e2', 'e2')`,
+    [queueId, rootId, executionId],
+  );
+  await pool.query(
+    `select * from otra.suspend_local(
+       $1::uuid, $2::uuid, $3::uuid, 'wp', array['e1','e2'], false)`,
+    [queueId, rootId, executionId],
+  );
+
+  // One blocker settles: the execution wakes (on-any) back to pending.
+  await pool.query(
+    `select otra.resolve_promise_local($1::uuid, $2::uuid, $3::uuid, '1'::jsonb)`,
+    [queueId, rootId, e1[0].id],
+  );
+
+  // A real worker claims it -- and immediately has the claim swept away.
+  const [claimed] = await db.claim("default", "w-real", 30, 1);
+  assert.equal(claimed?.executionId, executionId);
+  await pool.query(
+    `update otra.x_default set claimed_by = 'thief'
+      where root_id = $1 and id = $2`,
+    [rootId, executionId],
+  );
+
+  // The replay is fully memoized (no writes), re-parks on ['e1','e2'], and
+  // suspend_local must report the stolen claim -- not "replay again".
+  const outcome = await driveOnce(db, registered, claimed!, {
+    queue: "default",
+    workerId: "w-real",
+    claimSeconds: 30,
+  });
+  assert.equal(outcome.type, "lost");
 });
 
 test("cleanup deletes finished execution trees and old events", async () => {

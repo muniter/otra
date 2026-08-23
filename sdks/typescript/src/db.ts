@@ -124,8 +124,24 @@ export interface DetachCandidate {
   partitionTable: string;
 }
 
+// Postgres jsonb cannot hold U+0000 or an unpaired surrogate: both make
+// the INSERT itself fail (22P05/22P02), which is a poison pill rather than
+// a data problem. Neither is meaningful data -- a lone surrogate is not a
+// Unicode character at all -- so string VALUES are sanitized to U+FFFD on
+// the way in. (Found by fast-check; hostile object KEYS are rarer and are
+// handled by the driver's data-exception backstop instead.)
+const JSONB_HOSTILE =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
 function toJson(value: unknown): string {
-  const encoded = JSON.stringify(value === undefined ? null : value);
+  const encoded = JSON.stringify(
+    value === undefined ? null : value,
+    (_key, inner) =>
+      typeof inner === "string"
+        ? inner.replace(JSONB_HOSTILE, "\uFFFD")
+        : inner,
+  );
   // JSON.stringify still returns undefined for bare functions/symbols.
   return encoded === undefined ? "null" : encoded;
 }

@@ -321,6 +321,17 @@ export async function driveOnce(
     if (err instanceof DeterminismViolationError) {
       return reportFailedAttempt(serializeError(err), false);
     }
+    // A Postgres data exception (sqlstate class 22) from a journal write --
+    // e.g. a value jsonb cannot hold -- is deterministic: every retry would
+    // fail identically, so record it as a permanent failure instead of
+    // letting it escape as a poison pill that wedges the claim. Found by
+    // fast-check (U+0000 in a step result).
+    if (
+      typeof (err as { code?: unknown })?.code === "string" &&
+      (err as { code: string }).code.startsWith("22")
+    ) {
+      return reportFailedAttempt(serializeError(err), false);
+    }
     throw err; // infrastructure errors (e.g. lost DB) bubble to the worker
   } finally {
     clearInterval(heartbeat);
