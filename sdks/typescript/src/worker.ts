@@ -30,6 +30,9 @@ export interface WorkerOptions {
 /** Safety bound on immediate replays after a refused suspension. */
 const MAX_REDRIVES = 100;
 
+/** Poll cadence while an attached wake source is disconnected. */
+const DEGRADED_POLL_MS = 250;
+
 const UNKNOWN_TASK_DEFER_BASE_SECONDS = 15;
 const UNKNOWN_TASK_DEFER_JITTER_SECONDS = 15;
 
@@ -220,7 +223,14 @@ export class Worker {
           // parking: a notification landing in that gap must not be lost
           // under a long fallback interval.
           if (!this.pendingWake) {
-            let waitMs = this.pollIntervalMs;
+            // The long listening fallback is only safe while the wake
+            // source is actually CONNECTED; while it is down (or can never
+            // connect), degrade to a fast poll so latency never silently
+            // becomes the fallback interval.
+            let waitMs =
+              this.wakeSource === null || this.wakeSource.isConnected()
+                ? this.pollIntervalMs
+                : Math.min(this.pollIntervalMs, DEGRADED_POLL_MS);
             if (this.wakeSource !== null) {
               // Clock-driven work (timers, retries, lease expiries,
               // deadlines) never notifies; sleep exactly until the earliest

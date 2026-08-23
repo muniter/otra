@@ -30,6 +30,14 @@ something other than `main`.
   connection dies, and treats every (re)connect as a missed-notification
   hazard by polling once immediately.
 
+  Notifications are strictly a latency optimization, never a correctness
+  dependency: a worker whose listener cannot connect degrades to a fast
+  poll instead of silently keeping the long fallback, `getResult` waiters
+  filter wakes by queue and coalesce bursts, and
+  `otra.set_wake_notifications(false)` turns the whole layer off for
+  extreme-throughput deployments (NOTIFY-ing transactions serialize
+  briefly at commit), leaving a plain polling system.
+
 * Queue storage can now be reclaimed: `app.dropQueue(name, { force })` drops a
   queue and every physical relation named after it. It refuses while any
   execution is still non-terminal — those workers would hit a vanished table

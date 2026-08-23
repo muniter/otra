@@ -130,7 +130,11 @@ systems, and the decisions already made so you don't relitigate them.
   clock-driven work never notifies), and `pollIntervalMs` remains a slow
   safety-net poll (60s default when listening). If you add a state
   transition that makes work runnable NOW, it must `pg_notify('otra_wake',
-  <queue name>)` — on commit, which is what pg_notify does.
+  <queue name>)` — via `otra._notify_wake` (never `pg_notify` directly:
+  the wrapper honors the `set_wake_notifications` off switch). The whole
+  layer is a LATENCY OPTIMIZATION, never a correctness dependency —
+  liveness must hold with notifications disabled (there is a test), and a
+  disconnected hub makes workers poll fast rather than trust a dead wire.
 - **Gates, not sleeps:** async coordination in tests uses `EventEmitter` +
   `once(gate, "release")` rendezvous (a pattern taken from absurd's TS
   suite) and a `waitFor(condition)` poller

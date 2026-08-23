@@ -207,3 +207,75 @@ test("the listener survives having its connection killed", async () => {
     await worker.stop();
   }
 });
+
+test("a worker whose wake source is unhealthy falls back to a fast poll", async () => {
+  const { app } = env;
+  // A wake source that never connects (exhausted pool, or a proxy like
+  // pgbouncer in transaction mode where LISTEN silently cannot work). The
+  // worker must NOT keep its long listening fallback in that state, or
+  // every event-driven wake silently degrades to worst-case a minute.
+  const deadSource = {
+    subscribe: () => () => {},
+    isConnected: () => false,
+  };
+  app.task("degraded-hello", function* () {
+    return "still-works";
+  });
+  const worker = app.createWorker({ workerId: "w1", wake: deadSource });
+  worker.start();
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300)); // go idle
+    const started = Date.now();
+    const execution = await app.spawn("degraded-hello", null);
+    // getResult itself may listen; the assertion is on the WORKER picking
+    // the work up, which only a short degraded poll can explain.
+    await waitFor(
+      async () => (await app.getExecution(execution))!.status === "completed",
+      { timeoutMs: 5_000, label: "degraded worker completed the spawn" },
+    );
+    assert.ok(Date.now() - started < 5_000);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("notifications are an optimization: liveness holds with them disabled", async () => {
+  const { app, pool } = env;
+  await pool.query("select otra.set_wake_notifications(false)");
+  try {
+    // Prove nothing is emitted: a raw listener hears silence across a spawn.
+    const client = await pool.connect();
+    let heard = 0;
+    try {
+      await client.query("listen otra_wake");
+      client.on("notification", () => {
+        heard += 1;
+      });
+      app.task("silent-running", function* () {
+        return "done";
+      });
+      const execution = await app.spawn("silent-running", null);
+      // A short-poll worker still completes the work: the engine is a plain
+      // polling system when notifications are off, losing only latency.
+      const worker = app.startWorker({
+        workerId: "w1",
+        pollIntervalMs: 100,
+      });
+      try {
+        const result = await app.getResult<string>(execution, {
+          timeoutMs: 10_000,
+          pollMs: 100,
+        });
+        assert.equal(result, "done");
+      } finally {
+        await worker.stop();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(heard, 0, `expected silence, heard ${heard} notifications`);
+    } finally {
+      client.release();
+    }
+  } finally {
+    await pool.query("select otra.set_wake_notifications(true)");
+  }
+});

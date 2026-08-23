@@ -361,14 +361,28 @@ export class Otra {
     let interval = pollMs;
     let woken = false;
     let wakeNow: (() => void) | null = null;
-    const unsubscribe = this.wakeHub?.subscribe(() => {
+    // Filter wakes by queue name once the first snapshot reveals it: a busy
+    // installation notifies constantly, and R notifications/sec times G
+    // waiters of unfiltered wakes is pure amplification.
+    let queueName: string | null = null;
+    const unsubscribe = this.wakeHub?.subscribe((queue) => {
+      if (queue !== null && queueName !== null && queue !== queueName) return;
       woken = true;
       wakeNow?.();
     });
     try {
       while (true) {
+        const wasWoken = woken;
         woken = false;
+        if (wasWoken) {
+          // Coalesce notification bursts: at most one wake-triggered poll
+          // per ~20ms, whatever the queue's commit rate.
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
         const snapshot = await this.db.getExecution(execution);
+        if (queueName === null && snapshot !== null) {
+          queueName = snapshot.queue;
+        }
         const executionId = execution.executionId;
         if (snapshot === null) {
           throw new ExecutionFailedError(executionId, "failed", {

@@ -104,6 +104,30 @@ create or replace function otra.clear_fake_now () returns void as $$
   delete from otra.config where key = 'fake_now';
 $$ language sql;
 
+-- Wake notifications are a LATENCY OPTIMIZATION, never a correctness
+-- dependency: workers and getResult keep polling fallbacks, so disabling
+-- this turns otra into a plain polling system and nothing else changes.
+-- The off switch exists for extreme-throughput deployments: transactions
+-- that NOTIFY serialize briefly on the notification queue lock at commit,
+-- which can become measurable at thousands of notifying commits per second.
+create or replace function otra.set_wake_notifications (p_enabled boolean) returns void as $$
+  insert into otra.config (key, value)
+  values ('wake_notifications', case when p_enabled then 'on' else 'off' end)
+  on conflict (key) do update set value = excluded.value;
+$$ language sql;
+
+-- Every wake-worthy transition calls this instead of pg_notify directly.
+create or replace function otra._notify_wake (p_queue text) returns void as $$
+begin
+  if coalesce(
+       (select value from otra.config where key = 'wake_notifications'),
+       'on'
+     ) <> 'off' then
+    perform pg_notify('otra_wake', p_queue);
+  end if;
+end;
+$$ language plpgsql;
+
 -- UUIDv7 (time ordered), generated against otra.now() so partition routing and
 -- deterministic tests use the same clock on every supported PostgreSQL.
 create or replace function otra.uuid_v7 () returns uuid as $$
@@ -1528,7 +1552,7 @@ begin
       v_max_delay, v_max_duration;
   end if;
 
-  perform pg_notify('otra_wake', p_queue);
+  perform otra._notify_wake(p_queue);
   return query select v_queue_id, v_root, v_existing, true;
 end;
 $$ language plpgsql;
@@ -1848,7 +1872,7 @@ begin
   );
   -- Terminal notify: getResult waiters wake instead of polling out their
   -- backoff. (pg_notify delivers on COMMIT, so no premature wakes.)
-  perform pg_notify('otra_wake', v_name);
+  perform otra._notify_wake(v_name);
 end;
 $$ language plpgsql;
 
@@ -1979,7 +2003,7 @@ begin
   ) using p_root, p_execution_ids;
   get diagnostics v_woken = row_count;
   if v_woken > 0 then
-    perform pg_notify('otra_wake', v_name);
+    perform otra._notify_wake(v_name);
   end if;
 end;
 $$ language plpgsql;
@@ -2100,7 +2124,7 @@ begin
      values ($1, $2, $3, $4, ''child'', $5)',
     v_p
   ) using p_root, p_parent, p_key, p_label, v_id;
-  perform pg_notify('otra_wake', v_name);
+  perform otra._notify_wake(v_name);
   return query select p_queue, p_root, v_id, true;
 end;
 $$ language plpgsql;
@@ -2627,7 +2651,7 @@ begin
     if v_retry_at <= otra.now() then
       -- An immediate retry (undelivered cancel, blown deadline) should not
       -- wait for another worker's poll cycle.
-      perform pg_notify('otra_wake', v_name);
+      perform otra._notify_wake(v_name);
     end if;
     return query select true, false, v_retry_at;
   else
@@ -2646,7 +2670,7 @@ begin
         jsonb_build_object('name', 'CancelledError', 'message', 'execution was cancelled')
       else p_error end
     );
-    perform pg_notify('otra_wake', v_name);
+    perform otra._notify_wake(v_name);
     return query select true, true, null::timestamptz;
   end if;
 end;
@@ -2844,7 +2868,7 @@ begin
       execution_id := v_row.id; action := 'requested'; return next;
     end if;
   end loop;
-  perform pg_notify('otra_wake', v_name);
+  perform otra._notify_wake(v_name);
 end;
 $$ language plpgsql;
 
@@ -2918,7 +2942,7 @@ begin
     v_count := v_count + 1;
   end loop;
   if v_count > 0 then
-    perform pg_notify('otra_wake', v_name);
+    perform otra._notify_wake(v_name);
   end if;
   return v_count;
 end;
@@ -2955,7 +2979,7 @@ begin
     p_queue, p_root, p_execution, false, null,
     jsonb_build_object('name', 'CancelledError', 'message', 'execution was cancelled')
   );
-  perform pg_notify('otra_wake', v_name);
+  perform otra._notify_wake(v_name);
   return true;
 end;
 $$ language plpgsql;
@@ -3047,8 +3071,8 @@ begin
       where root_id = $2 and id = $3',
     v_x
   ) using v_max, p_root, p_execution;
-  perform pg_notify('otra_wake', v_name);
-  perform pg_notify('otra_wake', v_name);
+  perform otra._notify_wake(v_name);
+  perform otra._notify_wake(v_name);
   return query select p_execution, v_row.attempt, v_max;
 end;
 $$ language plpgsql;

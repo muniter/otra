@@ -9,6 +9,13 @@ export interface WakeSource {
    * poll once now). Returns an unsubscribe function.
    */
   subscribe(listener: (queue: string | null) => void): () => void;
+  /**
+   * Whether the LISTEN connection is currently established. Subscribers
+   * with polling fallbacks should poll FAST while this is false: an
+   * unhealthy source delivers nothing (an exhausted pool, or a proxy such
+   * as pgbouncer in transaction mode where LISTEN cannot work at all).
+   */
+  isConnected(): boolean;
 }
 
 type Listener = (queue: string | null) => void;
@@ -41,6 +48,10 @@ export class WakeHub implements WakeSource {
   constructor(pool: pg.Pool, onError?: (err: unknown) => void) {
     this.pool = pool;
     this.onError = onError ?? (() => {});
+  }
+
+  isConnected(): boolean {
+    return this.client !== null;
   }
 
   subscribe(listener: Listener): () => void {
