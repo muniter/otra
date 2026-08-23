@@ -94,11 +94,25 @@ export interface RetryStrategy {
   max_s?: number;
 }
 
+/**
+ * Wall-clock budgets enforced by the engine, in seconds.  A blown deadline is
+ * a GRACEFUL cancel -- the same request flag `app.cancel` sets -- so a worker
+ * delivers `CancelledError` and compensation runs; it is never a hard kill.
+ */
+export interface ExecutionDeadlines {
+  /** Give up if no worker has claimed the execution within this many seconds. */
+  maxDelaySeconds?: number;
+  /** Give up this many seconds after the FIRST claim, retries included. */
+  maxDurationSeconds?: number;
+}
+
 interface CommonSpawnOptions {
   maxAttempts?: number;
   retryStrategy?: RetryStrategy;
   /** Delay initial execution by this many seconds. */
   delaySeconds?: number;
+  /** Wall-clock budgets; blowing one gracefully cancels the execution. */
+  deadlines?: ExecutionDeadlines;
   /**
    * What a parent's graceful cancel does to this child: 'cascade' (default)
    * cancels it too; 'detach' lets it run to completion (fire-and-forget

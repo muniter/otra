@@ -168,6 +168,7 @@ through:
 `app.emitEvent(name, payload?)`, `app.resolvePromise(token, value)` /
 `app.rejectPromise(token, error)`, `app.getResult(execution)`,
 `app.getExecution(execution)`, `app.cancel(execution)`, `app.kill(execution)`,
+`app.retry(execution, opts?)`,
 `app.createQueue(name?)`, `app.getQueue(name?)`, `app.listQueues()`,
 `app.setQueuePolicy(name, policy)`, `app.getQueuePolicy(name?)`,
 `app.ensurePartitions(name?)`, `app.listDetachCandidates(name?)`,
@@ -181,6 +182,21 @@ and execution ID required for direct queue and partition routing. Workers run
 up to `concurrency` executions concurrently with slot-based
 claiming: one slow step never blocks the worker from picking up other work,
 and `stop()` drains in-flight executions gracefully.
+
+Spawns (top-level and child) also accept `deadlines: { maxDelaySeconds,
+maxDurationSeconds }` — wall-clock budgets for waiting to be claimed and for
+running once claimed (retries included). Blowing one is a **graceful cancel**,
+not a kill: the claim sweep requests cancellation, a worker delivers
+`CancelledError`, and compensation runs. A retry that would land past a
+`maxDurationSeconds` deadline is turned into that cancel immediately rather
+than being scheduled and then cancelled on arrival.
+
+`app.retry(execution, { maxAttempts? })` un-fails a permanently **failed root**
+execution in place: status back to `pending`, at least one more attempt, and
+the journal kept — replay fast-forwards through every settled step and
+resumes at the failure point. Children are refused (their parent has already
+observed the write-once child promise settle), and so are `completed` and
+`cancelled` executions.
 
 ### Cancellation
 
@@ -215,7 +231,9 @@ Two verbs, following every production engine surveyed in
 **Postgres owns**: spawning (idempotent under a parent promise key), claiming
 (with `FOR UPDATE SKIP LOCKED`), the timer sweep, event fan-out, suspension
 (atomic against concurrent resolution — no lost wakeups), retry scheduling
-with backoff, claim-expiry recovery, and result propagation up the tree. All
+with backoff (jittered up to +25%, so a fleet knocked over by one outage does
+not retry in lockstep; the caps stay absolute), the execution-deadline sweep,
+claim-expiry recovery, and result propagation up the tree. All
 of it inside [`sql/schema.sql`](sql/schema.sql); the SDK never issues SQL
 beyond `select * from otra.<function>(...)`.
 

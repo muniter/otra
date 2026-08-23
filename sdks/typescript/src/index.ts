@@ -25,6 +25,7 @@ export type {
   QueuePolicy,
   QueuePolicyOptions,
   QueueStorageMode,
+  RetryOutcome,
 } from "./db.ts";
 export { driveOnce } from "./driver.ts";
 export type { DriveOptions, DriveOutcome } from "./driver.ts";
@@ -47,6 +48,7 @@ export type {
   ChildSpawnOptions,
   DurableHandle,
   Effect,
+  ExecutionDeadlines,
   ExternalPromise,
   ErrorPayload,
   ExecutionRef,

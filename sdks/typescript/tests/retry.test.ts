@@ -103,6 +103,112 @@ test("TaskError(retryable=false) fails immediately", async () => {
   assert.equal(calls, 1);
 });
 
+// Retry backoff carries multiplicative jitter (up to +25%). Without it a
+// fleet of executions knocked over by one downstream outage retries in
+// lockstep forever, re-hammering the dependency at every backoff step.
+test("retry backoff is jittered, so co-failing executions do not retry in lockstep", async () => {
+  const { app, pool } = env;
+
+  const task = app.task("outage", function* (_params: null, ctx) {
+    yield* ctx.run("call-downstream", () => {
+      throw new Error("downstream down");
+    });
+  });
+
+  const refs = [];
+  for (let i = 0; i < 6; i++) {
+    refs.push(
+      await app.spawn(task, null, {
+        maxAttempts: 5,
+        retryStrategy: { kind: "fixed", base_s: 100, max_s: 3600 },
+      }),
+    );
+  }
+  // One tick, one frozen instant: every failure computes the same base delay.
+  const worker = app.createWorker({
+    workerId: "w1",
+    batchSize: 6,
+    concurrency: 6,
+  });
+  await worker.tick();
+
+  const { rows } = await pool.query(
+    `select extract(epoch from (run_after - otra.now())) as delay
+       from otra.x_default where id = any ($1::uuid[]) order by id`,
+    [refs.map((ref) => ref.executionId)],
+  );
+  const delays = rows.map((row: { delay: string }) => Number(row.delay));
+  assert.equal(delays.length, 6);
+  for (const delay of delays) {
+    assert.ok(delay >= 100 && delay <= 125, `delay ${delay} outside [100, 125]`);
+  }
+  // Six identical draws would be a ~1-in-astronomical coincidence.
+  assert.ok(
+    new Set(delays).size > 1,
+    `all six retries landed on the same instant (${delays[0]})`,
+  );
+});
+
+test("the backoff caps are absolute: jitter never pushes a retry past max_s", async () => {
+  const { app, pool } = env;
+
+  const task = app.task("capped", function* (_params: null, ctx) {
+    yield* ctx.run("boom", () => {
+      throw new Error("nope");
+    });
+  });
+
+  const refs = [];
+  for (let i = 0; i < 4; i++) {
+    refs.push(
+      await app.spawn(task, null, {
+        maxAttempts: 5,
+        // The cap equals the base, so the whole jitter window is clipped off.
+        retryStrategy: { kind: "fixed", base_s: 100, max_s: 100 },
+      }),
+    );
+  }
+  const worker = app.createWorker({
+    workerId: "w1",
+    batchSize: 4,
+    concurrency: 4,
+  });
+  await worker.tick();
+
+  const { rows } = await pool.query(
+    `select extract(epoch from (run_after - otra.now())) as delay
+       from otra.x_default where id = any ($1::uuid[])`,
+    [refs.map((ref) => ref.executionId)],
+  );
+  for (const row of rows as { delay: string }[]) {
+    assert.equal(Number(row.delay), 100);
+  }
+});
+
+test("a zero backoff stays exactly zero under jitter", async () => {
+  const { app, pool } = env;
+
+  const task = app.task("instant-retry", function* (_params: null, ctx) {
+    yield* ctx.run("boom", () => {
+      throw new Error("nope");
+    });
+  });
+
+  const execution = await app.spawn(task, null, {
+    maxAttempts: 5,
+    retryStrategy: { kind: "fixed", base_s: 0, max_s: 300 },
+  });
+  const worker = app.createWorker({ workerId: "w1" });
+  await worker.tick();
+
+  const { rows } = await pool.query(
+    `select extract(epoch from (run_after - otra.now())) as delay
+       from otra.x_default where root_id = $1 and id = $2`,
+    [execution.rootId, execution.executionId],
+  );
+  assert.equal(Number(rows[0].delay), 0);
+});
+
 test("a crashed worker's claim expires and another worker resumes the task", async () => {
   const { app, pool } = env;
   const calls = { before: 0, after: 0 };

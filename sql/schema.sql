@@ -205,7 +205,7 @@ for each row execute function otra._protect_queue_storage_identity();
 --   base tables      x_/p_/e_/i_ + name                        N + 2
 --   default parts    x_/p_ + name + '_d'                       N + 4
 --   week partitions  x_/p_ + name + '_' + to_char(.,'IYYYIW')  N + 9  <-- max
---   indexes          xi_ + name + '_ri'/'_pi'/'_ii'            N + 6
+--   indexes          xi_ + name + '_ri'/'_pi'/'_ii'/'_dl'/'_dd' N + 6
 --                    xi_ + name + '_cei'/'_fin'                N + 7
 --                    pi_ + name + '_wi'/'_ei'/'_ci'            N + 6
 --                    ei_ + name + '_ci', ii_ + name + '_ri'    N + 6
@@ -250,6 +250,7 @@ returns text[] as $$
     case when p_mode = 'partitioned' then 'i_' || p_name end,
     'xi_' || p_name || '_ri', 'xi_' || p_name || '_cei',
     'xi_' || p_name || '_pi', 'xi_' || p_name || '_fin',
+    'xi_' || p_name || '_dl', 'xi_' || p_name || '_dd',
     case when p_mode = 'unpartitioned' then 'xi_' || p_name || '_ii' end,
     'pi_' || p_name || '_wi', 'pi_' || p_name || '_ei',
     'pi_' || p_name || '_ci',
@@ -324,6 +325,9 @@ begin
        cancel_requested_at timestamptz,
        cancel_reason       text,
        on_parent_cancel    text not null default ''cascade'',
+       max_delay_s         double precision,
+       max_duration_s      double precision,
+       first_started_at    timestamptz,
        created_at          timestamptz not null default otra.now(),
        updated_at          timestamptz not null default otra.now(),
        finished_at         timestamptz,
@@ -424,6 +428,29 @@ begin
     'create index if not exists %I on otra.%I (child_execution_id) where kind = ''child''',
     'pi_' || v_name || '_ci',
     v_p
+  );
+  -- claim_local's deadline sweep, one partial index per candidate predicate.
+  -- The comparison itself (created_at + make_interval(secs => max_delay_s)
+  -- <= now) is NOT indexable -- timestamptz + interval is STABLE, so
+  -- PostgreSQL refuses it in an index expression -- but the WHERE clauses
+  -- below are exactly the sweep's other conjuncts, so each index holds only
+  -- the handful of live rows that carry that deadline at all, and orders them
+  -- by the timestamp the deadline is measured from.
+  execute format(
+    'create index if not exists %I on otra.%I (created_at)
+      where max_delay_s is not null and first_started_at is null
+        and cancel_requested_at is null
+        and status not in (''completed'', ''failed'', ''cancelled'')',
+    'xi_' || v_name || '_dl',
+    v_x
+  );
+  execute format(
+    'create index if not exists %I on otra.%I (first_started_at)
+      where max_duration_s is not null and first_started_at is not null
+        and cancel_requested_at is null
+        and status not in (''completed'', ''failed'', ''cancelled'')',
+    'xi_' || v_name || '_dd',
+    v_x
   );
   -- cleanup_local's candidate scan: terminal roots ordered by finished_at.
   execute format(
@@ -1124,6 +1151,15 @@ $$ language plpgsql;
 -- spawn can reject a bad strategy up front instead of letting it poison the
 -- claim sweep later (absurd's retry_delay_seconds lesson, commit 866480d).
 -- Delays are hard-capped at one day no matter what the strategy asks for.
+--
+-- The computed delay is then spread by multiplicative jitter of up to +25%.
+-- Without it the function is fully deterministic, so N executions knocked
+-- over by one downstream outage retry in lockstep forever -- every backoff
+-- step re-hammers the dependency with the same thundering herd.  The caps
+-- are applied AFTER jitter so they stay absolute, and a zero delay stays
+-- exactly zero (0 * anything is 0), which keeps the "retry NOW" paths sharp.
+-- This is what makes the function VOLATILE rather than immutable; nothing
+-- indexes or constant-folds it.
 create or replace function otra._backoff (p_strategy jsonb, p_attempt int) returns interval as $$
 declare
   v_kind text;
@@ -1179,7 +1215,37 @@ begin
   else
     v_delay := v_base * power(v_factor, greatest(p_attempt - 1, 0));
   end if;
+  v_delay := v_delay * (1 + random() * 0.25);
   return make_interval(secs => least(v_delay, v_max));
+end;
+$$ language plpgsql volatile;
+
+-- Read one execution deadline out of the spawn options, validating it the
+-- way _backoff validates a retry strategy: reject at spawn (errcode OT003)
+-- rather than letting a nonsense value poison the claim sweep later.  Both
+-- deadlines are seconds, matching delay_s.  Absent, JSON null and a missing
+-- key all mean "no deadline".
+create or replace function otra._deadline_seconds (p_opts jsonb, p_field text)
+returns double precision as $$
+declare
+  v_value double precision;
+begin
+  if p_opts is null or p_opts ->> p_field is null then
+    return null;
+  end if;
+  begin
+    v_value := (p_opts ->> p_field)::double precision;
+  exception when others then
+    raise exception 'deadline % must be a number of seconds, got %',
+      p_field, p_opts ->> p_field using errcode = 'OT003';
+  end;
+  -- Written so that NaN fails the test too (as in _backoff).
+  if not (v_value > 0 and v_value < 'Infinity'::double precision) then
+    raise exception
+      'deadline % must be a positive, finite number of seconds, got %',
+      p_field, p_opts ->> p_field using errcode = 'OT003';
+  end if;
+  return v_value;
 end;
 $$ language plpgsql immutable;
 
@@ -1215,6 +1281,9 @@ declare
     p_opts -> 'retry_strategy',
     '{"kind": "exponential", "base_s": 1, "factor": 2, "max_s": 300}'::jsonb
   );
+  v_max_delay double precision := otra._deadline_seconds(p_opts, 'max_delay_s');
+  v_max_duration double precision :=
+    otra._deadline_seconds(p_opts, 'max_duration_s');
 begin
   perform otra._backoff(v_strategy, 1);
   select q.id, q.storage_mode into v_queue_id, v_mode
@@ -1264,8 +1333,9 @@ begin
       execute format(
         'insert into otra.%I
            (id, root_id, function_name, params, max_attempts, retry_strategy,
-            run_after, idempotency_key, on_parent_cancel)
-         values ($1, $1, $2, $3, $4, $5, $6, $7, $8)
+            run_after, idempotency_key, on_parent_cancel,
+            max_delay_s, max_duration_s)
+         values ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          on conflict (idempotency_key) where idempotency_key is not null do nothing
          returning id',
         v_x
@@ -1274,7 +1344,8 @@ begin
         coalesce((p_opts ->> 'max_attempts')::int, 5),
         v_strategy, otra.now() + make_interval(secs => v_delay),
         v_idempotency_key,
-        coalesce(p_opts ->> 'on_parent_cancel', 'cascade');
+        coalesce(p_opts ->> 'on_parent_cancel', 'cascade'),
+        v_max_delay, v_max_duration;
       if v_existing is null then
         execute format(
           'select id from otra.%I where idempotency_key = $1 for key share',
@@ -1291,30 +1362,33 @@ begin
       execute format(
         'insert into otra.%I
            (id, root_id, function_name, params, max_attempts, retry_strategy,
-            run_after, on_parent_cancel)
-         values ($1, $1, $2, $3, $4, $5, $6, $7)
+            run_after, on_parent_cancel, max_delay_s, max_duration_s)
+         values ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
          returning id',
         v_x
       ) into v_existing using
         v_id, p_function, p_params,
         coalesce((p_opts ->> 'max_attempts')::int, 5),
         v_strategy, otra.now() + make_interval(secs => v_delay),
-        coalesce(p_opts ->> 'on_parent_cancel', 'cascade');
+        coalesce(p_opts ->> 'on_parent_cancel', 'cascade'),
+        v_max_delay, v_max_duration;
     end if;
     v_root := v_existing;
   else
     execute format(
       'insert into otra.%I
          (id, root_id, function_name, params, max_attempts, retry_strategy,
-          run_after, idempotency_key, on_parent_cancel)
-       values ($1, $1, $2, $3, $4, $5, $6, $7, $8)',
+          run_after, idempotency_key, on_parent_cancel,
+          max_delay_s, max_duration_s)
+       values ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
       v_x
     ) using
       v_existing, p_function, p_params,
       coalesce((p_opts ->> 'max_attempts')::int, 5),
       v_strategy, otra.now() + make_interval(secs => v_delay),
       v_idempotency_key,
-      coalesce(p_opts ->> 'on_parent_cancel', 'cascade');
+      coalesce(p_opts ->> 'on_parent_cancel', 'cascade'),
+      v_max_delay, v_max_duration;
   end if;
 
   perform pg_notify('otra_wake', p_queue);
@@ -1344,6 +1418,7 @@ declare
   v_now timestamptz := otra.now();
   v_woken record;
   v_crashed record;
+  v_overdue record;
 begin
   if p_claim_seconds is null or p_claim_seconds <= 0 then
     raise exception 'claim lease must be positive, got %', p_claim_seconds
@@ -1421,11 +1496,47 @@ begin
     );
   end loop;
 
+  -- Execution deadlines (absurd's cancellation policy, sql/absurd.sql:947).
+  -- A blown deadline is a GRACEFUL cancel, not a hard kill: request_cancel_local
+  -- sets the same flag app.cancel sets, so a worker delivers CancelledError and
+  -- compensation runs.  Candidates are read WITHOUT locks and the loop visits
+  -- them in the global (root_id, id) order; request_cancel_local takes its own
+  -- ordered locks over the tree and re-checks the row's state under them.
+  -- Bounded like every other sweep here -- absurd's own version of this sweep
+  -- has neither a LIMIT nor SKIP LOCKED, which makes one poll's cost
+  -- proportional to the backlog.  Rows that already carry a cancel request are
+  -- skipped: the deadline has been acted on, and re-requesting would only
+  -- overwrite nothing (coalesce) while re-walking the tree every poll.
+  for v_overdue in execute format(
+    'select root_id, id,
+            case when max_delay_s is not null and first_started_at is null
+                 then ''exceeded maxDelay of '' || max_delay_s || ''s''
+                 else ''exceeded maxDuration of '' || max_duration_s || ''s''
+            end as reason
+       from otra.%I
+      where status not in (''completed'', ''failed'', ''cancelled'')
+        and cancel_requested_at is null
+        and (
+          (max_delay_s is not null and first_started_at is null
+           and $1 >= created_at + make_interval(secs => max_delay_s))
+          or
+          (max_duration_s is not null and first_started_at is not null
+           and $1 >= first_started_at + make_interval(secs => max_duration_s))
+        )
+      order by root_id, id limit 100',
+    v_x
+  ) using v_now loop
+    perform * from otra.request_cancel_local(
+      v_queue_id, v_overdue.root_id, v_overdue.id, true, v_overdue.reason
+    );
+  end loop;
+
   return query execute format(
     'update otra.%1$I e
         set status = ''running'',
             claimed_by = $1,
             claim_expires_at = $2 + make_interval(secs => $3),
+            first_started_at = coalesce(e.first_started_at, $2),
             updated_at = $2
       where (e.root_id, e.id) in (
         select c.root_id, c.id
@@ -1721,6 +1832,9 @@ declare
     p_opts -> 'retry_strategy',
     '{"kind": "exponential", "base_s": 1, "factor": 2, "max_s": 300}'::jsonb
   );
+  v_max_delay double precision := otra._deadline_seconds(p_opts, 'max_delay_s');
+  v_max_duration double precision :=
+    otra._deadline_seconds(p_opts, 'max_duration_s');
   v_name text;
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue
@@ -1751,14 +1865,16 @@ begin
   execute format(
     'insert into otra.%I
        (id, root_id, function_name, params, parent_id, max_attempts,
-        retry_strategy, run_after, on_parent_cancel)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        retry_strategy, run_after, on_parent_cancel,
+        max_delay_s, max_duration_s)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
     v_x
   ) using
     v_id, p_root, p_function, p_params, p_parent,
     coalesce((p_opts ->> 'max_attempts')::int, 5), v_strategy,
     otra.now() + make_interval(secs => v_delay),
-    coalesce(p_opts ->> 'on_parent_cancel', 'cascade');
+    coalesce(p_opts ->> 'on_parent_cancel', 'cascade'),
+    v_max_delay, v_max_duration;
   execute format(
     'insert into otra.%I
        (root_id, execution_id, key, label, kind, child_execution_id)
@@ -2177,6 +2293,8 @@ declare
   v_row record;
   v_delivered boolean;
   v_retry_at timestamptz;
+  v_deadline_cancel boolean := false;
+  v_deadline_reason text;
 begin
   select q.name into v_name from otra.queues q where q.id = p_queue;
   v_x := 'x_' || v_name;
@@ -2187,7 +2305,7 @@ begin
   perform otra._lock_terminal_scope(v_x, p_root, p_execution);
   execute format(
     'select status, attempt, max_attempts, retry_strategy, cancel_requested_at,
-            claimed_by, claim_expires_at
+            claimed_by, claim_expires_at, max_duration_s, first_started_at
        from otra.%I where root_id = $1 and id = $2',
     v_x
   ) into v_row using p_root, p_execution;
@@ -2226,17 +2344,47 @@ begin
         v_retry_at := otra.now() + otra._backoff(v_row.retry_strategy, v_row.attempt + 1);
       exception when others then v_retry_at := null;
       end;
+      -- maxDuration interplay (absurd sql:1279-1286).  A retry scheduled at
+      -- or beyond the deadline would only wake up to be cancelled, and the
+      -- cancel would sit undelivered for the whole backoff.  Request the
+      -- cancel now and run the retry IMMEDIATELY instead -- our invariant:
+      -- an undelivered cancel retries NOW, so a worker delivers
+      -- CancelledError and compensation gets to run inside the budget.
+      -- Only reachable when '$cancel' is NOT yet journaled (the branch
+      -- above owns that case), so compensation retries keep their backoff.
+      if v_retry_at is not null
+         and v_row.max_duration_s is not null
+         and v_row.first_started_at is not null
+         and v_retry_at >= v_row.first_started_at
+                           + make_interval(secs => v_row.max_duration_s) then
+        v_deadline_cancel := true;
+        v_deadline_reason :=
+          'exceeded maxDuration of ' || v_row.max_duration_s || 's';
+        v_retry_at := otra.now();
+      end if;
     end if;
   end if;
   if v_retry_at is not null then
+    -- The cancel request is flagged on this row only.  Cascading to
+    -- descendants would mean calling request_cancel_local, which locks the
+    -- whole tree -- and we already hold self + parent, so a descendant with a
+    -- smaller id would be taken out of the global ascending order.  Each
+    -- descendant carrying its own deadline is picked up by claim_local's
+    -- sweep, which cascades properly from an unlocked start.
     execute format(
       'update otra.%I
           set status = ''pending'', attempt = attempt + 1, run_after = $1,
               claimed_by = null, claim_expires_at = null, error = $2,
+              cancel_requested_at = case when $5
+                then coalesce(cancel_requested_at, otra.now())
+                else cancel_requested_at end,
+              cancel_reason = case when $5
+                then coalesce(cancel_reason, $6) else cancel_reason end,
               updated_at = otra.now()
         where root_id = $3 and id = $4',
       v_x
-    ) using v_retry_at, p_error, p_root, p_execution;
+    ) using v_retry_at, p_error, p_root, p_execution,
+            v_deadline_cancel, v_deadline_reason;
     return query select true, false, v_retry_at;
   else
     execute format(
@@ -2548,6 +2696,96 @@ begin
     jsonb_build_object('name', 'CancelledError', 'message', 'execution was cancelled')
   );
   return true;
+end;
+$$ language plpgsql;
+
+-- Operator retry of a permanently-failed execution (adapted from absurd's
+-- retry_task, sql/absurd.sql:1335-1455).  Two deliberate differences:
+--
+--   * ROOT-ONLY.  absurd retries any task; here a child's result promise is
+--     write-once and its parent has already OBSERVED it reject, so un-failing
+--     the child would contradict a settled journal entry.  Retry the root and
+--     let the replay re-drive the tree instead.
+--   * The journal is KEPT.  absurd reuses checkpoints only and re-runs the
+--     task body from the top; otra's replay fast-forwards through the whole
+--     memoized history, so the execution resumes from the failure point --
+--     settled steps, timers, events and children are not re-executed.
+--
+-- 'cancelled' is NOT retryable: cancellation owns its outcome (invariant 8),
+-- and compensation has already run, so there is nothing coherent to resume.
+-- 'completed' is refused for the obvious reason.  `error` is deliberately
+-- left in place: an ordinary retry leaves the last failure on the pending row
+-- too, and it is the forensic record of why an operator had to intervene.
+-- `first_started_at` is likewise untouched: a maxDuration budget is absolute
+-- wall-clock, so retrying an execution that already blew one hands it
+-- straight back to claim_local's deadline sweep -- as it should.
+create or replace function otra.retry_local (
+  p_queue uuid,
+  p_root uuid,
+  p_execution uuid,
+  p_max_attempts int default null
+) returns table (execution_id uuid, attempt int, max_attempts int) as $$
+declare
+  v_name text;
+  v_x text;
+  v_row record;
+  v_max int;
+begin
+  select q.name into v_name from otra.queues q where q.id = p_queue
+    for key share;
+  if not found then raise exception 'Queue % does not exist', p_queue; end if;
+  v_x := 'x_' || v_name;
+  if p_max_attempts is not null and p_max_attempts < 1 then
+    raise exception 'max_attempts must be at least 1, got %', p_max_attempts
+      using errcode = 'OT003';
+  end if;
+  -- The same ordered-lock preamble every terminal-adjacent transition uses.
+  -- _lock_terminal_scope is moot here: this function is root-only and a
+  -- root's parent set is empty, so it degenerates to a plain self lock.  It
+  -- is called anyway so the pattern -- and the global ascending-(root_id, id)
+  -- order it encodes -- stays uniform across every such transition.
+  perform otra._lock_terminal_scope(v_x, p_root, p_execution);
+  execute format(
+    'select status, attempt, max_attempts, parent_id
+       from otra.%I where root_id = $1 and id = $2',
+    v_x
+  ) into v_row using p_root, p_execution;
+  if v_row.status is null then
+    raise exception 'execution % does not exist in queue "%"',
+      p_execution, v_name using errcode = 'OT003';
+  end if;
+  if v_row.parent_id is not null then
+    raise exception
+      'execution % is a child of %; only a root execution can be retried (its parent has already observed the write-once child promise settle)',
+      p_execution, v_row.parent_id using errcode = 'OT003';
+  end if;
+  if v_row.status <> 'failed' then
+    raise exception
+      'execution % is %; only a failed execution can be retried',
+      p_execution, v_row.status using errcode = 'OT003';
+  end if;
+
+  -- At least one more attempt must exist, or the retry would fail the
+  -- execution again on sight.
+  v_max := coalesce(
+    p_max_attempts, greatest(v_row.max_attempts, v_row.attempt + 1)
+  );
+  if v_max <= v_row.attempt then
+    raise exception
+      'max_attempts (%) must be greater than the % attempt(s) already made',
+      v_max, v_row.attempt using errcode = 'OT003';
+  end if;
+
+  execute format(
+    'update otra.%I
+        set status = ''pending'', run_after = otra.now(),
+            max_attempts = $1, claimed_by = null, claim_expires_at = null,
+            finished_at = null, updated_at = otra.now()
+      where root_id = $2 and id = $3',
+    v_x
+  ) using v_max, p_root, p_execution;
+  perform pg_notify('otra_wake', v_name);
+  return query select p_execution, v_row.attempt, v_max;
 end;
 $$ language plpgsql;
 

@@ -12,6 +12,7 @@ import {
   type QueuePolicy,
   type QueuePolicyOptions,
   type QueueStorageMode,
+  type RetryOutcome,
 } from "./db.ts";
 import { Worker, type WorkerOptions } from "./worker.ts";
 import {
@@ -219,6 +220,7 @@ export class Otra {
         maxAttempts: options.maxAttempts ?? registered?.maxAttempts,
         retryStrategy: options.retryStrategy ?? registered?.retryStrategy,
         delaySeconds: options.delaySeconds,
+        deadlines: options.deadlines,
         idempotencyKey: options.idempotencyKey,
         onParentCancel: options.onParentCancel,
       },
@@ -342,6 +344,26 @@ export class Otra {
       options.cascade ?? true,
       options.reason ?? null,
     );
+  }
+
+  /**
+   * Operator retry of a permanently-failed execution: resume it in place,
+   * from where it failed. The journal is kept, so replay fast-forwards
+   * through every settled step -- only the work after the failure point runs
+   * again. `maxAttempts` overrides the attempt budget; by default one more
+   * attempt is granted.
+   *
+   * ROOT-ONLY: retrying a child is refused, because its parent has already
+   * observed the write-once child promise reject -- retry the root instead.
+   * Only 'failed' executions are retryable: 'cancelled' is terminal
+   * (cancellation owns its outcome, and compensation already ran) and
+   * 'completed' has nothing to redo.
+   */
+  async retry(
+    execution: ExecutionRef,
+    options: { maxAttempts?: number } = {},
+  ): Promise<RetryOutcome> {
+    return this.db.retry(execution, options.maxAttempts ?? null);
   }
 
   /**

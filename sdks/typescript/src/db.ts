@@ -76,6 +76,14 @@ export interface Queue {
   storageMode: QueueStorageMode;
 }
 
+/** What an operator retry left behind: attempts spent, and the new budget. */
+export interface RetryOutcome {
+  executionId: string;
+  /** Attempts already made; the resumed run will be this many plus one. */
+  attempt: number;
+  maxAttempts: number;
+}
+
 export type QueueStorageMode = "unpartitioned" | "partitioned";
 export type QueueDetachMode = "none" | "empty";
 
@@ -116,6 +124,10 @@ function normalizeSpawnOptions(
   if (options.retryStrategy !== undefined)
     opts.retry_strategy = options.retryStrategy;
   if (options.delaySeconds !== undefined) opts.delay_s = options.delaySeconds;
+  if (options.deadlines?.maxDelaySeconds !== undefined)
+    opts.max_delay_s = options.deadlines.maxDelaySeconds;
+  if (options.deadlines?.maxDurationSeconds !== undefined)
+    opts.max_duration_s = options.deadlines.maxDurationSeconds;
   if ("idempotencyKey" in options && options.idempotencyKey !== undefined)
     opts.idempotency_key = options.idempotencyKey;
   if (options.onParentCancel !== undefined)
@@ -700,6 +712,33 @@ export class Db {
       ],
     );
     return rows[0].killed;
+  }
+
+  /**
+   * Operator retry of a permanently-failed ROOT execution: resume it in
+   * place, journal and all.  Throws (OT003) for a child, for any status
+   * other than 'failed', and for an attempt budget that leaves nothing to
+   * retry.
+   */
+  async retry(
+    execution: ExecutionRef,
+    maxAttempts: number | null = null,
+  ): Promise<RetryOutcome> {
+    const { rows } = await this.client.query(
+      `select execution_id, attempt, max_attempts
+         from otra.retry_local($1::uuid, $2::uuid, $3::uuid, $4::int)`,
+      [
+        execution.queueId,
+        execution.rootId,
+        execution.executionId,
+        maxAttempts,
+      ],
+    );
+    return {
+      executionId: rows[0].execution_id,
+      attempt: rows[0].attempt,
+      maxAttempts: rows[0].max_attempts,
+    };
   }
 
   async finalizeCancelled(
